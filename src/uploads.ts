@@ -24,6 +24,47 @@ export interface UploadsPublication {
   readonly sizeBytes: number;
 }
 
+function requireUploadsSuccess(
+  result: Awaited<ReturnType<typeof runExact>>,
+  environment: NodeJS.ProcessEnv,
+): void {
+  if (result.exitCode === 0) return;
+  const termination =
+    result.error ??
+    (result.exitCode === null
+      ? `terminated by ${result.signal ?? "an unknown signal"}`
+      : `exited ${result.exitCode}`);
+  throw new Error(
+    `uploads put ${termination}: ${safeDetail(result.stderr || result.stdout, environment)}`,
+  );
+}
+
+function uploadsPutArgv(
+  executable: string,
+  filePath: string,
+  key: string,
+  workspace: string | undefined,
+): readonly [string, ...string[]] {
+  const workspaceArgs = workspace === undefined ? [] : ["--workspace", workspace];
+  return [
+    executable,
+    "put",
+    filePath,
+    "--key",
+    key,
+    ...workspaceArgs,
+    "--content-type",
+    "video/mp4",
+    "--no-optimize",
+    "--no-git",
+    "--no-auto",
+    "--no-pr",
+    "--format",
+    "json",
+    "--replace",
+  ];
+}
+
 /** Publish one finalized MP4 through the authenticated uploads.sh CLI. */
 export async function uploadFinalMp4(options: UploadFinalMp4Options): Promise<UploadsPublication> {
   assertUploadsKey(options.key);
@@ -34,25 +75,13 @@ export async function uploadFinalMp4(options: UploadFinalMp4Options): Promise<Up
   }
 
   const environment = uploadsEnvironment(options.environment ?? process.env, options.workspace);
-  const workspaceArgs = options.workspace === undefined ? [] : ["--workspace", options.workspace];
   const result = await runExact(
-    [
+    uploadsPutArgv(
       options.executable ?? "uploads",
-      "put",
       options.filePath,
-      "--key",
       options.key,
-      ...workspaceArgs,
-      "--content-type",
-      "video/mp4",
-      "--no-optimize",
-      "--no-git",
-      "--no-auto",
-      "--no-pr",
-      "--format",
-      "json",
-      "--replace",
-    ],
+      options.workspace,
+    ),
     {
       environment,
       timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
@@ -60,22 +89,20 @@ export async function uploadFinalMp4(options: UploadFinalMp4Options): Promise<Up
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     },
   );
-  if (result.exitCode !== 0) {
-    const termination =
-      result.error ??
-      (result.exitCode === null
-        ? `terminated by ${result.signal ?? "an unknown signal"}`
-        : `exited ${result.exitCode}`);
-    throw new Error(
-      `uploads put ${termination}: ${safeDetail(result.stderr || result.stdout, environment)}`,
-    );
-  }
+  requireUploadsSuccess(result, environment);
   const publication = parseUploadsPublication(result.stdout, options.key, source.size);
   await verifyHostedPublication(
     publication,
     Math.min(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, 10_000),
   );
   return publication;
+}
+
+function assertAdvisorySize(value: unknown, expectedSizeBytes: number): void {
+  if (value === undefined || value === null) return;
+  if (!Number.isSafeInteger(value) || value !== expectedSizeBytes) {
+    throw new Error("uploads put returned an unexpected file size");
+  }
 }
 
 /** Parse the CLI's single JSON response and bind it to the requested upload. */
@@ -105,20 +132,8 @@ export function parseUploadsPublication(
     throw new Error("uploads put response is missing its URL");
   }
   const url = parsePublicUrl(parsed.url);
-  if (
-    parsed.size !== undefined &&
-    parsed.size !== null &&
-    (!Number.isSafeInteger(parsed.size) || parsed.size !== expectedSizeBytes)
-  ) {
-    throw new Error("uploads put returned an unexpected file size");
-  }
-  if (
-    parsed.sizeBytes !== undefined &&
-    parsed.sizeBytes !== null &&
-    (!Number.isSafeInteger(parsed.sizeBytes) || parsed.sizeBytes !== expectedSizeBytes)
-  ) {
-    throw new Error("uploads put returned an unexpected file size");
-  }
+  assertAdvisorySize(parsed.size, expectedSizeBytes);
+  assertAdvisorySize(parsed.sizeBytes, expectedSizeBytes);
   return {
     key: expectedKey,
     url,

@@ -109,27 +109,29 @@ const COMMANDS = [
   },
 ] as const;
 
-async function main(argv: readonly string[]): Promise<number> {
-  const command = argv[0];
-  if (command === undefined) {
-    writeSuccess(helpPayload(), "help", "none");
-    return 0;
-  }
-  if (command === "--help" || command === "help" || command === "manifest") {
-    if (argv.length !== 1)
-      return fail(new UsageError(`${command} does not accept arguments`), command);
+const INFO_COMMANDS = new Set(["--help", "help", "manifest"]);
+
+function requireNoExtraArgs(command: string, argv: readonly string[]): number | undefined {
+  if (argv.length === 1) return undefined;
+  return fail(new UsageError(`${command} does not accept arguments`), command);
+}
+
+function runInfoCommand(command: string, argv: readonly string[]): number | undefined {
+  if (INFO_COMMANDS.has(command)) {
+    const extra = requireNoExtraArgs(command, argv);
+    if (extra !== undefined) return extra;
     writeSuccess(helpPayload(), "help", "none");
     return 0;
   }
   if (command === "--brief") {
-    if (argv.length !== 1)
-      return fail(new UsageError("--brief does not accept arguments"), command);
+    const extra = requireNoExtraArgs(command, argv);
+    if (extra !== undefined) return extra;
     writeSuccess({ brief: brief() }, "brief", "none");
     return 0;
   }
   if (command === "--version") {
-    if (argv.length !== 1)
-      return fail(new UsageError("--version does not accept arguments"), command);
+    const extra = requireNoExtraArgs(command, argv);
+    if (extra !== undefined) return extra;
     writeSuccess({ version: CLI_VERSION }, "version", "none");
     return 0;
   }
@@ -139,15 +141,29 @@ async function main(argv: readonly string[]): Promise<number> {
     writeSuccess({ command: commandDefinition(command) }, `${command} --help`, "none");
     return 0;
   }
+  return undefined;
+}
 
+async function runCommand(command: string, argv: readonly string[]): Promise<number> {
+  if (command === "start") return startCommand(argv);
+  if (command === "status") return statusCommand(argv);
+  if (command === "stop") return stopCommand(argv);
+  throw new UsageError(
+    `Unknown command: ${command}`,
+    "Run 'sandbox-video --help' and select a command from data.commands.",
+  );
+}
+
+async function main(argv: readonly string[]): Promise<number> {
+  const command = argv[0];
+  if (command === undefined) {
+    writeSuccess(helpPayload(), "help", "none");
+    return 0;
+  }
+  const info = runInfoCommand(command, argv);
+  if (info !== undefined) return info;
   try {
-    if (command === "start") return await startCommand(argv.slice(1));
-    if (command === "status") return await statusCommand(argv.slice(1));
-    if (command === "stop") return await stopCommand(argv.slice(1));
-    throw new UsageError(
-      `Unknown command: ${command}`,
-      "Run 'sandbox-video --help' and select a command from data.commands.",
-    );
+    return await runCommand(command, argv.slice(1));
   } catch (error) {
     return fail(error, command);
   }

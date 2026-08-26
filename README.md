@@ -272,6 +272,9 @@ pnpm test
 pnpm pack --dry-run
 ```
 
+`pnpm check` formats, typechecks, and lints. oxlint enforces a cyclomatic
+complexity ceiling of 15 on `src/`.
+
 The npm tarball contains only the CLI runtime, uploads.sh adapter, README,
 agent skill, and license. The benchmark applications and historical quality
 artifacts remain in GitHub but are not distributed with the package.

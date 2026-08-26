@@ -20,6 +20,14 @@ Vercel Sandbox image. The root CLI package uses pnpm.
 The published package has no runtime npm dependencies. Keep provider SDKs and
 benchmark dependencies out of the CLI unless its runtime genuinely needs them.
 
+## Lint
+
+`pnpm lint` runs oxlint with `--deny-warnings`. Cyclomatic complexity is capped
+at 15 for `src/` (`eslint/complexity`). That is stricter than oxlint's default
+of 20 and looser than 12, which starts punishing linear validation (`??`, `?.`,
+and optional JSON fields) instead of real branching. Extract a helper when a
+function grows a new independent path; do not disable the rule.
+
 ## Project boundaries
 
 - The CLI runs inside an existing Vercel Sandbox. It does not provision one.
