@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { open, unlink, writeFile } from "node:fs/promises";
+import { open, stat, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -15,8 +15,10 @@ import {
   type OwnedProcessIdentity,
 } from "./owned.js";
 import {
+  assertCompatibleConfig,
   assertCompatibleSession,
   CONFIG_NAME,
+  DEFAULT_STARTUP_TIMEOUT_MS,
   ensureRuntimeDirectory,
   finishState,
   hasLiveOwnedProcess,
@@ -30,6 +32,7 @@ import {
   sessionPaths,
   SUPERVISOR_LOG_NAME,
   validateRuntimeDirectory,
+  type NormalizedSessionConfig,
   type RecordingSessionState,
   type RecordingSessionStatus,
   type StartSessionOptions,
@@ -59,7 +62,7 @@ export async function startSession(options: StartSessionOptions): Promise<Record
   await ensureRuntimeDirectory(config.runtimeDirectory);
   const existing = await readState(config.runtimeDirectory);
   if (existing !== null) {
-    assertCompatibleSession(existing, config);
+    await assertCompatibleAttach(existing, config);
     return waitForStarted(existing, config.startupTimeoutMs);
   }
 
@@ -72,9 +75,7 @@ export async function startSession(options: StartSessionOptions): Promise<Record
     });
   } catch (error) {
     if (!hasCode(error, "EEXIST")) throw error;
-    const state = await waitForState(config.runtimeDirectory, config.startupTimeoutMs);
-    assertCompatibleSession(state, config);
-    return state;
+    return attachToExistingClaim(config, configPath);
   }
 
   const logPath = join(config.runtimeDirectory, SUPERVISOR_LOG_NAME);
@@ -104,8 +105,68 @@ export async function startSession(options: StartSessionOptions): Promise<Record
     assertCompatibleSession(state, config);
     return state;
   } catch (error) {
+    const late = await lateStartedState(config);
+    if (late !== null) return late;
     await reapFailedStartup(config.runtimeDirectory, configPath, supervisor);
     throw error;
+  }
+}
+
+/** Attach checks: state geometry plus the stored claim's URL and upload target. */
+async function assertCompatibleAttach(
+  state: RecordingSessionState,
+  config: NormalizedSessionConfig,
+): Promise<void> {
+  assertCompatibleSession(state, config);
+  const stored = await readSessionConfig(state.runtimeDirectory).catch(() => null);
+  if (stored !== null) assertCompatibleConfig(stored, config);
+}
+
+async function attachToExistingClaim(
+  config: NormalizedSessionConfig,
+  configPath: string,
+): Promise<RecordingSessionState> {
+  try {
+    const state = await waitForState(config.runtimeDirectory, config.startupTimeoutMs);
+    await assertCompatibleAttach(state, config);
+    return state;
+  } catch (error) {
+    await releaseAbandonedClaim(config.runtimeDirectory, configPath);
+    throw error;
+  }
+}
+
+/**
+ * A startup that finished just after the caller's deadline is a healthy
+ * recording, not a failure: return it instead of reaping it.
+ */
+async function lateStartedState(
+  config: NormalizedSessionConfig,
+): Promise<RecordingSessionState | null> {
+  const state = await readState(config.runtimeDirectory).catch(() => null);
+  if (state === null || state.phase !== "recording") return null;
+  assertCompatibleSession(state, config);
+  return state;
+}
+
+/**
+ * Free a runtime directory wedged by another caller's abandoned claim: the
+ * config exists, no state ever appeared, and the claim's own startup window
+ * has fully elapsed. A live supervisor writes state within seconds of
+ * spawning, so an expired claim proves its supervisor died before recording.
+ */
+async function releaseAbandonedClaim(runtimeDirectory: string, configPath: string): Promise<void> {
+  const state = await readState(runtimeDirectory).catch(() => null);
+  if (state !== null) return;
+  // A corrupt claim (stored === null) can never produce state, but is still
+  // only removed once the floored window elapses, so a transient read error
+  // or a tiny configured timeout cannot delete a live caller's claim.
+  const stored = await readSessionConfig(runtimeDirectory).catch(() => null);
+  const claim = await stat(configPath).catch(() => null);
+  if (claim === null) return;
+  const window = Math.max(stored?.startupTimeoutMs ?? 0, DEFAULT_STARTUP_TIMEOUT_MS) + 5_000;
+  if (Date.now() - claim.mtimeMs > window) {
+    await unlink(configPath).catch(() => undefined);
   }
 }
 

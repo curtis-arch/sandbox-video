@@ -52,6 +52,13 @@ const COMMANDS = [
         required: false,
         sourceFallback: "UPLOADS_WORKSPACE",
       },
+      {
+        name: "--startup-timeout-ms",
+        type: "integer",
+        required: false,
+        default: 30_000,
+        description: "Fail start if the recording is not capturing within this window.",
+      },
     ],
     agentInstructions: [
       "Retain data.recordingId and every token in data.agentBrowserCommand.",
@@ -156,20 +163,26 @@ async function main(argv: readonly string[]): Promise<number> {
 }
 
 async function startCommand(argv: readonly string[]): Promise<number> {
-  const flags = parseFlags(argv, new Set(["fps", "size", "url", "uploads-workspace"]));
+  const flags = parseFlags(
+    argv,
+    new Set(["fps", "size", "url", "uploads-workspace", "startup-timeout-ms"]),
+  );
   const recordingId = randomUUID();
   const fpsValue = integer(flags.get("fps") ?? String(DEFAULT_FPS), "--fps");
   if (fpsValue !== 30 && fpsValue !== 60) throw new UsageError("--fps must be 30 or 60");
   const { width, height } = parseSize(flags.get("size") ?? `${DEFAULT_WIDTH}x${DEFAULT_HEIGHT}`);
   const workspace = flags.get("uploads-workspace") ?? process.env.UPLOADS_WORKSPACE;
   const initialUrl = flags.get("url");
+  const startupTimeout = flags.get("startup-timeout-ms");
+  const startupTimeoutMs =
+    startupTimeout === undefined ? undefined : integer(startupTimeout, "--startup-timeout-ms");
   const state = await startSession({
     recordingId,
     runtimeDirectory: runtimeDirectoryFor(recordingId),
     width,
     height,
     fps: fpsValue,
-    ...defined({ initialUrl }),
+    ...defined({ initialUrl, startupTimeoutMs }),
     upload: {
       key: `screenshots/sandbox-video/${recordingId}/proof.mp4`,
       ...defined({ workspace }),

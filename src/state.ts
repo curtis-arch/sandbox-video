@@ -502,6 +502,23 @@ export function assertCompatibleSession(
   }
 }
 
+/**
+ * The durable state does not carry the initial URL or upload target, so an
+ * attach also compares those against the stored config claim.
+ */
+export function assertCompatibleConfig(
+  stored: NormalizedSessionConfig,
+  requested: NormalizedSessionConfig,
+): void {
+  if (
+    stored.initialUrl !== requested.initialUrl ||
+    stored.upload?.key !== requested.upload?.key ||
+    stored.upload?.workspace !== requested.upload?.workspace
+  ) {
+    throw new Error("runtimeDirectory already belongs to a different recording configuration");
+  }
+}
+
 function normalizeUpload(options: RecordingUploadOptions): RecordingUploadOptions {
   assertUploadsKey(options.key);
   if (options.workspace !== undefined) assertUploadsWorkspace(options.workspace);

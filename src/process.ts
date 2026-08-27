@@ -1,5 +1,9 @@
 import { spawn } from "node:child_process";
 
+import { settleWithin } from "./util.js";
+
+const STREAM_CLOSE_GRACE_MS = 1_000;
+
 export interface ExactCommandResult {
   readonly exitCode: number | null;
   readonly signal: NodeJS.Signals | null;
@@ -15,18 +19,21 @@ export interface ExactCommandOptions {
   readonly signal?: AbortSignal;
 }
 
-/** Run one argv-safe subprocess and return only after its output streams close. */
-export async function runExact(
-  argv: readonly [string, ...string[]],
-  options: ExactCommandOptions,
-): Promise<ExactCommandResult> {
+function assertRunOptions(options: ExactCommandOptions): void {
   if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs <= 0) {
     throw new Error("Command timeout must be a positive safe integer");
   }
   if (!Number.isSafeInteger(options.outputLimitBytes) || options.outputLimitBytes <= 0) {
     throw new Error("Command output limit must be a positive safe integer");
   }
+}
 
+/** Run one argv-safe subprocess and return once it exits and its output settles. */
+export async function runExact(
+  argv: readonly [string, ...string[]],
+  options: ExactCommandOptions,
+): Promise<ExactCommandResult> {
+  assertRunOptions(options);
   options.signal?.throwIfAborted();
   const child = spawn(argv[0], argv.slice(1), {
     env: options.environment ?? process.env,
@@ -63,6 +70,9 @@ export async function runExact(
   options.signal?.addEventListener("abort", abort, { once: true });
 
   try {
+    const closed = new Promise<void>((resolve) => {
+      child.once("close", () => resolve());
+    });
     const result = await new Promise<{
       readonly exitCode: number | null;
       readonly signal: NodeJS.Signals | null;
@@ -71,10 +81,23 @@ export async function runExact(
       child.once("error", (error) => {
         resolve({ exitCode: null, signal: null, error: error.message });
       });
-      child.once("close", (exitCode, signal) => {
+      child.once("exit", (exitCode, signal) => {
         resolve({ exitCode, signal });
       });
     });
+    // Wait briefly for the output streams to drain, but do not require it: a
+    // grandchild that daemonized while inheriting the pipes would otherwise
+    // hold "close" open until the command timeout despite a clean exit. A
+    // spawn failure emits no "close", so skip the grace wait entirely. When
+    // the grace expires, destroy the pipes so a holdout grandchild cannot
+    // keep this process alive or keep feeding the buffers.
+    if (
+      result.error === undefined &&
+      (await settleWithin(closed, STREAM_CLOSE_GRACE_MS)) === null
+    ) {
+      child.stdout.destroy();
+      child.stderr.destroy();
+    }
     if (exceededLimit) throw new Error(`${argv[0]} output exceeded the safety limit`);
     if (timedOut) throw new Error(`${argv[0]} timed out`);
     options.signal?.throwIfAborted();

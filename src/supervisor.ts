@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, rename, unlink } from "node:fs/promises";
+import { chmod, mkdir, realpath, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -747,7 +747,7 @@ async function acquireDisplay(
     }
     const stale = await readLockOwner(lockPath);
     if (stale !== null && !(await identityIsAlive(stale))) {
-      if (await removeStaleLock(lockPath, stale)) offset -= 1;
+      if (await removeStaleLock(lockPath, owner)) offset -= 1;
     }
   }
   throw new Error("No recording-owned X display is available");
@@ -820,8 +820,14 @@ function requireSuccess(label: string, result: ExactCommandResult): void {
   }
 }
 
+// The realpath fallback keeps the check correct when NODE_OPTIONS carries
+// --preserve-symlinks, where argv[1] may stay a symlink while the module URL
+// is resolved.
+const entryPath = process.argv[1];
 const isEntryModule =
-  process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+  entryPath !== undefined &&
+  (import.meta.url === pathToFileURL(entryPath).href ||
+    import.meta.url === pathToFileURL(await realpath(entryPath).catch(() => entryPath)).href);
 
 if (isEntryModule) {
   const configPath = process.argv[2];

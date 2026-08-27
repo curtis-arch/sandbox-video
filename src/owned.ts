@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { link, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { link, open, readFile, unlink, writeFile } from "node:fs/promises";
 
 import {
   delay,
@@ -146,7 +146,15 @@ export async function tryCreateOwnedLock(
 
 export async function readLockOwner(path: string): Promise<OwnedProcessIdentity | null> {
   try {
-    const parsed = parseObject(await readBoundedText(path), "lock");
+    return parseLockOwner(await readBoundedText(path));
+  } catch {
+    return null;
+  }
+}
+
+function parseLockOwner(source: string): OwnedProcessIdentity | null {
+  try {
+    const parsed = parseObject(source, "lock");
     return isIdentity(parsed) ? parsed : null;
   } catch {
     return null;
@@ -154,28 +162,50 @@ export async function readLockOwner(path: string): Promise<OwnedProcessIdentity 
 }
 
 /**
- * Remove a lock believed stale without racing a contender that already
- * replaced it: claim the file atomically via rename, verify what was caught,
- * and restore it when it turned out to be a live owner's fresh lock.
+ * Remove a lock believed stale without ever deleting a live owner's lock:
+ * removal is serialized through a short-lived breaker lock, and only the
+ * breaker holder may unlink the target, after re-verifying under the breaker
+ * that its recorded owner is really dead (or its content unreadable). A
+ * contender that replaced the lock between the caller's look and the removal
+ * is therefore seen as live and left untouched.
  */
 export async function removeStaleLock(
   path: string,
-  stale: OwnedProcessIdentity | null,
+  breaker: OwnedProcessIdentity,
 ): Promise<boolean> {
-  const graveyard = `${path}.${randomUUID()}.stale`;
-  try {
-    await rename(path, graveyard);
-  } catch {
+  const breakerPath = `${path}.breaker`;
+  if (!(await tryCreateOwnedLock(breakerPath, breaker))) {
+    // Unlink a contender's breaker only when its holder was actually read and
+    // is dead; a null read (vanished or unreadable) must not remove a breaker
+    // that a live contender may have just created.
+    let holder: OwnedProcessIdentity | null = null;
+    try {
+      holder = parseLockOwner(await readBoundedText(breakerPath));
+    } catch {
+      return false;
+    }
+    if (holder !== null && !(await identityIsAlive(holder))) {
+      await unlink(breakerPath).catch(() => undefined);
+    }
     return false;
   }
-  const caught = await readLockOwner(graveyard);
-  const caughtFreshLock =
-    caught !== null &&
-    (stale === null || !sameIdentity(caught, stale)) &&
-    (await identityIsAlive(caught));
-  if (caughtFreshLock) await link(graveyard, path).catch(() => undefined);
-  await unlink(graveyard).catch(() => undefined);
-  return !caughtFreshLock;
+  try {
+    let current: OwnedProcessIdentity | null = null;
+    try {
+      current = parseLockOwner(await readBoundedText(path));
+    } catch (error) {
+      if (hasCode(error, "ENOENT")) return true;
+      // An unreadable lock (oversize, interference) can never be verified
+      // live; treat it as corrupt and removable, as the caller already did.
+    }
+    if (current !== null && (await identityIsAlive(current))) return false;
+    await unlink(path).catch((error: unknown) => {
+      if (!hasCode(error, "ENOENT")) throw error;
+    });
+    return true;
+  } finally {
+    await unlink(breakerPath).catch(() => undefined);
+  }
 }
 
 export async function releaseOwnedLock(path: string, owner: OwnedProcessIdentity): Promise<void> {
@@ -191,9 +221,11 @@ export async function acquireRecoveryLock(
     if (await tryCreateOwnedLock(path, owner)) return true;
     const current = await readLockOwner(path);
     if (current !== null && (await identityIsAlive(current))) return false;
-    await removeStaleLock(path, current);
+    await removeStaleLock(path, owner);
   }
-  return false;
+  // A removal on the final attempt must still get its create retry, or a
+  // freed lock would be reported as unacquirable.
+  return tryCreateOwnedLock(path, owner);
 }
 
 export async function spawnManaged(
