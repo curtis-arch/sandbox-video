@@ -193,6 +193,25 @@ interface FinalizationResult {
 
 type FinalizationTimeout = (maximumMs: number, label: string) => number;
 
+type FinalizationAttempt = (
+  label: string,
+  maximumMs: number,
+  operation: (timeoutMs: number) => Promise<void>,
+) => Promise<boolean>;
+
+interface SessionPaths {
+  readonly captureDirectory: string;
+  readonly playlistPath: string;
+  readonly segmentPattern: string;
+  readonly finalMp4Path: string;
+  readonly xauthorityPath: string;
+  readonly supervisorLogPath: string;
+  readonly xvfbLogPath: string;
+  readonly openboxLogPath: string;
+  readonly ffmpegLogPath: string;
+  readonly ffmpegProgressPath: string;
+}
+
 /** Start one recording, or return the durable result of an earlier call for this directory. */
 export async function startSession(options: StartSessionOptions): Promise<RecordingSessionState> {
   const config = normalizeOptions(options);
@@ -264,34 +283,62 @@ export async function stopSession(options: StopSessionOptions): Promise<Recordin
   const first = await getSessionStatus(directory);
   if (!first.exists) return first;
   const config = await readSessionConfig(directory);
-  const ownedProcessAlive = await hasLiveOwnedProcess(first.state);
-  const displayLockHeld = await hasOwnedDisplayLock(first.state);
-  if (
-    !isActive(first.state.phase) &&
-    !ownedProcessAlive &&
-    !displayLockHeld &&
-    browserCleanupComplete(first.state) &&
-    publicationComplete(first.state, config)
-  ) {
-    return first;
-  }
+  if (await isFullyReleased(first.state, config)) return first;
 
   if (isActive(first.state.phase) && first.supervisorAlive) {
-    await signalOwned(first.state.supervisor, "SIGTERM");
-    const terminal = await waitForTerminalState(
+    const terminal = await terminateSupervisor(
+      first.state.supervisor,
       directory,
-      remainingTimeout(deadline, timeoutMs, "stop"),
+      deadline,
+      timeoutMs,
     );
     if (terminal !== null) return terminal;
-    await signalOwned(first.state.supervisor, "SIGKILL");
-    if (Date.now() >= deadline) {
-      return failStopAtDeadline(directory, "Recording stop exceeded its timeout");
-    }
-    await waitForIdentityExit(first.state.supervisor, remainingTimeout(deadline, 2_000, "stop"));
-    if (Date.now() >= deadline) {
-      return failStopAtDeadline(directory, "Recording stop exceeded its timeout");
-    }
   }
+  return recoverUnderLock(directory, deadline, timeoutMs);
+}
+
+/** True once nothing owned by the recording remains: processes, locks, browser, upload. */
+async function isFullyReleased(
+  state: RecordingSessionState,
+  config: NormalizedSessionConfig,
+): Promise<boolean> {
+  return (
+    !isActive(state.phase) &&
+    !(await hasLiveOwnedProcess(state)) &&
+    !(await hasOwnedDisplayLock(state)) &&
+    browserCleanupComplete(state) &&
+    publicationComplete(state, config)
+  );
+}
+
+async function terminateSupervisor(
+  supervisor: OwnedProcessIdentity,
+  directory: string,
+  deadline: number,
+  timeoutMs: number,
+): Promise<RecordingSessionStatus | null> {
+  await signalOwned(supervisor, "SIGTERM");
+  const terminal = await waitForTerminalState(
+    directory,
+    remainingTimeout(deadline, timeoutMs, "stop"),
+  );
+  if (terminal !== null) return terminal;
+  await signalOwned(supervisor, "SIGKILL");
+  if (Date.now() >= deadline) {
+    return failStopAtDeadline(directory, "Recording stop exceeded its timeout");
+  }
+  await waitForIdentityExit(supervisor, remainingTimeout(deadline, 2_000, "stop"));
+  if (Date.now() >= deadline) {
+    return failStopAtDeadline(directory, "Recording stop exceeded its timeout");
+  }
+  return null;
+}
+
+async function recoverUnderLock(
+  directory: string,
+  deadline: number,
+  timeoutMs: number,
+): Promise<RecordingSessionStatus> {
   const recoveryOwner = await currentIdentity();
   const recoveryLockPath = join(directory, RECOVERY_LOCK_NAME);
   if (!(await acquireRecoveryLock(recoveryLockPath, recoveryOwner))) {
@@ -309,13 +356,7 @@ export async function stopSession(options: StopSessionOptions): Promise<Recordin
   } catch (error) {
     const current = await readState(directory);
     if (current === null) throw error;
-    const now = new Date().toISOString();
-    recovered = await updateState(current, {
-      phase: "failed",
-      failure: errorMessage(error),
-      updatedAt: now,
-      finishedAt: now,
-    });
+    recovered = await finishState(current, errorMessage(error), []);
   } finally {
     await releaseDisplayLock(recoveryLockPath, recoveryOwner);
   }
@@ -327,16 +368,84 @@ export async function stopSession(options: StopSessionOptions): Promise<Recordin
   };
 }
 
+/** Persist the terminal phase: "finished" when no failure, "failed" with its cause otherwise. */
+async function finishState(
+  state: RecordingSessionState,
+  failure: string | undefined,
+  warnings: readonly string[],
+): Promise<RecordingSessionState> {
+  const now = new Date().toISOString();
+  return updateState(state, {
+    phase: failure === undefined ? "finished" : "failed",
+    ...(failure === undefined ? {} : { failure }),
+    ...(warnings.length === 0 ? {} : { warnings: [...warnings] }),
+    updatedAt: now,
+    finishedAt: now,
+  });
+}
+
+interface SuperviseProcesses {
+  xvfb?: ManagedProcess;
+  openbox?: ManagedProcess;
+  ffmpeg?: ManagedProcess;
+}
+
 async function supervise(configPath: string): Promise<void> {
   const config = parseConfig(await readBoundedText(configPath), configPath);
   const supervisor = await currentIdentity();
   const paths = sessionPaths(config.runtimeDirectory);
   const browserId = `sv-${config.id.replaceAll("-", "").slice(0, 16)}`;
-  const agentBrowserSession = browserId;
-  const agentBrowserNamespace = browserId;
   const displayReservation = await acquireDisplay(config, supervisor);
+  let state = await writeInitialState(config, supervisor, paths, displayReservation, browserId);
+
+  const stop = watchStopSignal();
+  const processes: SuperviseProcesses = {};
+  const warnings: string[] = [];
+  let failure: string | undefined;
+  try {
+    state = await startRecordingStack(config, paths, displayReservation.display, processes, state);
+    await raceStopAgainstExits(stop.requested, processes);
+  } catch (error) {
+    failure = errorMessage(error);
+  }
+
+  try {
+    try {
+      const finalized = await finalizeRecording(
+        config,
+        state,
+        managedProcessControl(processes),
+        (maximumMs) => maximumMs,
+        warnings,
+      );
+      state = finalized.state;
+      failure ??= finalized.failure;
+    } catch (error) {
+      failure ??= errorMessage(error);
+      warnings.push(`finalization: ${errorMessage(error)}`);
+    }
+    if (failure === undefined && warnings.length > 0) {
+      failure = `Recording cleanup was incomplete: ${warnings.join("; ")}`;
+    }
+    state = await finishState(state, failure, warnings);
+    if (failure !== undefined) process.exitCode = 1;
+  } finally {
+    stop.dispose();
+    if (!(await hasLiveOwnedProcess(state))) {
+      await releaseDisplayLock(state.displayLockPath, supervisor);
+    }
+  }
+}
+
+async function writeInitialState(
+  config: NormalizedSessionConfig,
+  supervisor: OwnedProcessIdentity,
+  paths: SessionPaths,
+  displayReservation: { readonly display: string; readonly lockPath: string },
+  browserId: string,
+): Promise<RecordingSessionState> {
   const startedAt = new Date().toISOString();
-  let state: RecordingSessionState = {
+  const state: RecordingSessionState = {
     schemaVersion: SESSION_SCHEMA_VERSION,
     id: config.id,
     phase: "starting",
@@ -348,8 +457,8 @@ async function supervise(configPath: string): Promise<void> {
     segmentPattern: paths.segmentPattern,
     finalMp4Path: paths.finalMp4Path,
     supervisorLogPath: paths.supervisorLogPath,
-    agentBrowserSession,
-    agentBrowserNamespace,
+    agentBrowserSession: browserId,
+    agentBrowserNamespace: browserId,
     width: config.width,
     height: config.height,
     fps: config.fps,
@@ -365,231 +474,224 @@ async function supervise(configPath: string): Promise<void> {
     await releaseDisplayLock(displayReservation.lockPath, supervisor);
     throw error;
   }
+  return state;
+}
 
-  let xvfb: ManagedProcess | undefined;
-  let openbox: ManagedProcess | undefined;
-  let ffmpeg: ManagedProcess | undefined;
-  let stopRequested = false;
+function watchStopSignal(): { readonly requested: Promise<void>; readonly dispose: () => void } {
   let requestStop: (() => void) | undefined;
-  const stopSignal = new Promise<void>((resolve) => {
+  const requested = new Promise<void>((resolve) => {
     requestStop = resolve;
   });
-  const onStop = () => {
-    if (stopRequested) return;
-    stopRequested = true;
-    requestStop?.();
-  };
+  const onStop = () => requestStop?.();
   process.on("SIGINT", onStop);
   process.on("SIGTERM", onStop);
+  return {
+    requested,
+    dispose: () => {
+      process.removeListener("SIGINT", onStop);
+      process.removeListener("SIGTERM", onStop);
+    },
+  };
+}
 
-  const warnings: string[] = [];
-  let failure: string | undefined;
-  try {
-    await mkdir(paths.captureDirectory, { recursive: true, mode: 0o700 });
-    await chmod(paths.captureDirectory, 0o700);
-    const cookieResult = await runExact([config.executables.mcookie], {
-      timeoutMs: 5_000,
-    });
-    requireSuccess("mcookie", cookieResult);
-    const cookie = cookieResult.stdout.trim();
-    if (!/^[a-f0-9]+$/iu.test(cookie)) throw new Error("mcookie returned an invalid cookie");
-    requireSuccess(
-      "xauth",
-      await runExact(
-        [
-          config.executables.xauth,
-          "-f",
-          paths.xauthorityPath,
-          "add",
-          displayReservation.display,
-          ".",
-          cookie,
-        ],
-        { timeoutMs: 5_000 },
-      ),
-    );
-    await chmod(paths.xauthorityPath, 0o600);
-    const displayEnvironment = {
-      ...process.env,
-      DISPLAY: displayReservation.display,
-      XAUTHORITY: paths.xauthorityPath,
-    };
+/** Bring up Xauthority, Xvfb, openbox, the browser, and FFmpeg, persisting each owned PID. */
+async function startRecordingStack(
+  config: NormalizedSessionConfig,
+  paths: SessionPaths,
+  display: string,
+  processes: SuperviseProcesses,
+  initialState: RecordingSessionState,
+): Promise<RecordingSessionState> {
+  let state = initialState;
+  await mkdir(paths.captureDirectory, { recursive: true, mode: 0o700 });
+  await chmod(paths.captureDirectory, 0o700);
+  const displayEnvironment = await createXauthority(config, paths, display);
 
-    xvfb = await spawnManaged(
+  processes.xvfb = await spawnManaged(
+    xvfbArgs(config, paths, display),
+    displayEnvironment,
+    paths.xvfbLogPath,
+  );
+  state = await updateState(state, { xvfb: processes.xvfb.identity });
+  await waitForCommand(
+    [config.executables.xdpyinfo, "-display", display],
+    displayEnvironment,
+    processes.xvfb,
+    config.startupTimeoutMs,
+  );
+
+  processes.openbox = await spawnManaged(
+    [config.executables.openbox, "--sm-disable"],
+    displayEnvironment,
+    paths.openboxLogPath,
+  );
+  state = await updateState(state, { openbox: processes.openbox.identity });
+  await waitForCommand(
+    [config.executables.xprop, "-root", "_NET_SUPPORTING_WM_CHECK"],
+    displayEnvironment,
+    processes.openbox,
+    config.startupTimeoutMs,
+    "_NET_SUPPORTING_WM_CHECK(WINDOW)",
+  );
+
+  state = await updateState(state, { browserStartAttemptedAt: new Date().toISOString() });
+  await openInitialPage(config, displayEnvironment, state);
+
+  processes.ffmpeg = await spawnManaged(
+    ffmpegCaptureArgs(config, paths, display),
+    displayEnvironment,
+    paths.ffmpegLogPath,
+  );
+  state = await updateState(state, { ffmpeg: processes.ffmpeg.identity });
+  await waitForFfmpeg(processes.ffmpeg, paths.ffmpegProgressPath, config.startupTimeoutMs);
+
+  return updateState(state, { phase: "recording" });
+}
+
+async function createXauthority(
+  config: NormalizedSessionConfig,
+  paths: SessionPaths,
+  display: string,
+): Promise<NodeJS.ProcessEnv> {
+  const cookieResult = await runExact([config.executables.mcookie], { timeoutMs: 5_000 });
+  requireSuccess("mcookie", cookieResult);
+  const cookie = cookieResult.stdout.trim();
+  if (!/^[a-f0-9]+$/iu.test(cookie)) throw new Error("mcookie returned an invalid cookie");
+  requireSuccess(
+    "xauth",
+    await runExact(
+      [config.executables.xauth, "-f", paths.xauthorityPath, "add", display, ".", cookie],
+      { timeoutMs: 5_000 },
+    ),
+  );
+  await chmod(paths.xauthorityPath, 0o600);
+  return { ...process.env, DISPLAY: display, XAUTHORITY: paths.xauthorityPath };
+}
+
+async function openInitialPage(
+  config: NormalizedSessionConfig,
+  displayEnvironment: NodeJS.ProcessEnv,
+  state: RecordingSessionState,
+): Promise<void> {
+  const agentEnvironment = {
+    ...displayEnvironment,
+    AGENT_BROWSER_SESSION: state.agentBrowserSession,
+    AGENT_BROWSER_NAMESPACE: state.agentBrowserNamespace,
+    AGENT_BROWSER_HEADED: "1",
+    AGENT_BROWSER_NO_XVFB: "1",
+    AGENT_BROWSER_ALLOW_FILE_ACCESS: "1",
+    AGENT_BROWSER_ARGS: "--start-maximized",
+  };
+  requireSuccess(
+    "agent-browser bootstrap",
+    await runExact(
       [
-        config.executables.xvfb,
-        displayReservation.display,
-        "-screen",
-        "0",
-        `${config.width}x${config.height}x24`,
-        "-nolisten",
-        "tcp",
-        "-auth",
-        paths.xauthorityPath,
+        config.executables.agentBrowser,
+        "--session",
+        state.agentBrowserSession,
+        "--namespace",
+        state.agentBrowserNamespace,
+        "--headed",
+        "open",
+        config.initialUrl,
       ],
-      displayEnvironment,
-      paths.xvfbLogPath,
-    );
-    state = await updateState(state, { xvfb: xvfb.identity });
-    await waitForCommand(
-      [config.executables.xdpyinfo, "-display", displayReservation.display],
-      displayEnvironment,
-      xvfb,
-      config.startupTimeoutMs,
-    );
+      { environment: agentEnvironment, timeoutMs: config.startupTimeoutMs },
+    ),
+  );
+}
 
-    openbox = await spawnManaged(
-      [config.executables.openbox, "--sm-disable"],
-      displayEnvironment,
-      paths.openboxLogPath,
-    );
-    state = await updateState(state, { openbox: openbox.identity });
-    await waitForCommand(
-      [config.executables.xprop, "-root", "_NET_SUPPORTING_WM_CHECK"],
-      displayEnvironment,
-      openbox,
-      config.startupTimeoutMs,
-      "_NET_SUPPORTING_WM_CHECK(WINDOW)",
-    );
+function xvfbArgs(
+  config: NormalizedSessionConfig,
+  paths: SessionPaths,
+  display: string,
+): [string, ...string[]] {
+  return [
+    config.executables.xvfb,
+    display,
+    "-screen",
+    "0",
+    `${config.width}x${config.height}x24`,
+    "-nolisten",
+    "tcp",
+    "-auth",
+    paths.xauthorityPath,
+  ];
+}
 
-    const agentEnvironment = {
-      ...displayEnvironment,
-      AGENT_BROWSER_SESSION: agentBrowserSession,
-      AGENT_BROWSER_NAMESPACE: agentBrowserNamespace,
-      AGENT_BROWSER_HEADED: "1",
-      AGENT_BROWSER_NO_XVFB: "1",
-      AGENT_BROWSER_ALLOW_FILE_ACCESS: "1",
-      AGENT_BROWSER_ARGS: "--start-maximized",
-    };
-    state = await updateState(state, { browserStartAttemptedAt: new Date().toISOString() });
-    requireSuccess(
-      "agent-browser bootstrap",
-      await runExact(
-        [
-          config.executables.agentBrowser,
-          "--session",
-          agentBrowserSession,
-          "--namespace",
-          agentBrowserNamespace,
-          "--headed",
-          "open",
-          config.initialUrl,
-        ],
-        { environment: agentEnvironment, timeoutMs: config.startupTimeoutMs },
-      ),
-    );
+function ffmpegCaptureArgs(
+  config: NormalizedSessionConfig,
+  paths: SessionPaths,
+  display: string,
+): [string, ...string[]] {
+  const keyframeInterval = config.fps * 2;
+  return [
+    config.executables.ffmpeg,
+    "-y",
+    "-hide_banner",
+    "-loglevel",
+    "warning",
+    "-f",
+    "x11grab",
+    "-framerate",
+    String(config.fps),
+    "-video_size",
+    `${config.width}x${config.height}`,
+    "-i",
+    `${display}.0`,
+    "-an",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "12",
+    "-pix_fmt",
+    "yuv420p",
+    "-fps_mode",
+    "passthrough",
+    "-g",
+    String(keyframeInterval),
+    "-keyint_min",
+    String(keyframeInterval),
+    "-sc_threshold",
+    "0",
+    "-force_key_frames",
+    `expr:gte(t,n_forced*${config.segmentDurationSeconds})`,
+    "-f",
+    "hls",
+    "-hls_time",
+    String(config.segmentDurationSeconds),
+    "-hls_list_size",
+    "0",
+    "-hls_segment_type",
+    "mpegts",
+    "-hls_flags",
+    "independent_segments+temp_file",
+    "-hls_segment_filename",
+    paths.segmentPattern,
+    "-progress",
+    paths.ffmpegProgressPath,
+    "-stats_period",
+    "0.25",
+    "-nostats",
+    paths.playlistPath,
+  ];
+}
 
-    const keyframeInterval = config.fps * 2;
-    ffmpeg = await spawnManaged(
-      [
-        config.executables.ffmpeg,
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "warning",
-        "-f",
-        "x11grab",
-        "-framerate",
-        String(config.fps),
-        "-video_size",
-        `${config.width}x${config.height}`,
-        "-i",
-        `${displayReservation.display}.0`,
-        "-an",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "12",
-        "-pix_fmt",
-        "yuv420p",
-        "-fps_mode",
-        "passthrough",
-        "-g",
-        String(keyframeInterval),
-        "-keyint_min",
-        String(keyframeInterval),
-        "-sc_threshold",
-        "0",
-        "-force_key_frames",
-        `expr:gte(t,n_forced*${config.segmentDurationSeconds})`,
-        "-f",
-        "hls",
-        "-hls_time",
-        String(config.segmentDurationSeconds),
-        "-hls_list_size",
-        "0",
-        "-hls_segment_type",
-        "mpegts",
-        "-hls_flags",
-        "independent_segments+temp_file",
-        "-hls_segment_filename",
-        paths.segmentPattern,
-        "-progress",
-        paths.ffmpegProgressPath,
-        "-stats_period",
-        "0.25",
-        "-nostats",
-        paths.playlistPath,
-      ],
-      displayEnvironment,
-      paths.ffmpegLogPath,
-    );
-    state = await updateState(state, { ffmpeg: ffmpeg.identity });
-    await waitForFfmpeg(ffmpeg, paths.ffmpegProgressPath, config.startupTimeoutMs);
-
-    state = await updateState(state, { phase: "recording" });
-
-    const event = await Promise.race([
-      stopSignal.then(() => ({ type: "stop" as const })),
-      unexpectedExit("Xvfb", xvfb),
-      unexpectedExit("openbox", openbox),
-      unexpectedExit("FFmpeg", ffmpeg),
-    ]);
-    if (event.type === "exit") throw new Error(event.message);
-  } catch (error) {
-    failure = errorMessage(error);
-  }
-
-  try {
-    try {
-      const finalized = await finalizeRecording(
-        config,
-        state,
-        managedProcessControl({
-          ...(xvfb === undefined ? {} : { xvfb }),
-          ...(openbox === undefined ? {} : { openbox }),
-          ...(ffmpeg === undefined ? {} : { ffmpeg }),
-        }),
-        (maximumMs) => maximumMs,
-        warnings,
-      );
-      state = finalized.state;
-      failure ??= finalized.failure;
-    } catch (error) {
-      failure ??= errorMessage(error);
-      warnings.push(`finalization: ${errorMessage(error)}`);
-    }
-    if (failure === undefined && warnings.length > 0) {
-      failure = `Recording cleanup was incomplete: ${warnings.join("; ")}`;
-    }
-    const now = new Date().toISOString();
-    state = await updateState(state, {
-      phase: failure === undefined ? "finished" : "failed",
-      ...(failure === undefined ? {} : { failure }),
-      ...(warnings.length === 0 ? {} : { warnings }),
-      updatedAt: now,
-      finishedAt: now,
-    });
-    if (failure !== undefined) process.exitCode = 1;
-  } finally {
-    process.removeListener("SIGINT", onStop);
-    process.removeListener("SIGTERM", onStop);
-    if (!(await hasLiveOwnedProcess(state))) {
-      await releaseDisplayLock(state.displayLockPath, supervisor);
-    }
-  }
+/** Resolves on a stop signal; throws when any owned process exits first. */
+async function raceStopAgainstExits(
+  stopRequested: Promise<void>,
+  processes: SuperviseProcesses,
+): Promise<void> {
+  const exits: Promise<{ readonly type: "exit"; readonly message: string }>[] = [];
+  if (processes.xvfb !== undefined) exits.push(unexpectedExit("Xvfb", processes.xvfb));
+  if (processes.openbox !== undefined) exits.push(unexpectedExit("openbox", processes.openbox));
+  if (processes.ffmpeg !== undefined) exits.push(unexpectedExit("FFmpeg", processes.ffmpeg));
+  const event = await Promise.race([
+    stopRequested.then(() => ({ type: "stop" as const })),
+    ...exits,
+  ]);
+  if (event.type === "exit") throw new Error(event.message);
 }
 
 async function finalizeRecording(
@@ -620,81 +722,14 @@ async function finalizeRecording(
   };
 
   try {
-    if (browserCleanupRequired(state) && state.browserClosedAt === undefined) {
-      state = await updateState(state, { phase: "closing_browser" });
-      const browserClosed = await attempt(
-        "agent-browser cleanup",
-        config.stopTimeoutMs,
-        (timeoutMs) => closeAgentBrowser(config, state, timeoutMs),
-      );
-      if (browserClosed) {
-        state = await updateState(state, { browserClosedAt: new Date().toISOString() });
-      }
-    }
-
+    state = await closeBrowserPhase(config, state, attempt);
     state = await updateState(state, { phase: "stopping_capture" });
     if (control.captureStarted) {
       captureStopped = await attempt("FFmpeg cleanup", config.stopTimeoutMs, control.stopCapture);
     }
-
-    if (captureStopped && state.publication === undefined) {
-      const playlistPresent = await fileIsNonempty(state.playlistPath);
-      if (playlistPresent) {
-        state = await updateState(state, { phase: "finalizing_mp4" });
-        const temporaryMp4Path = join(state.runtimeDirectory, `.recording-${randomUUID()}.tmp.mp4`);
-        try {
-          requireSuccess(
-            "final MP4 remux",
-            await runExact(
-              [
-                config.executables.ffmpeg,
-                "-y",
-                "-v",
-                "error",
-                "-i",
-                state.playlistPath,
-                "-c",
-                "copy",
-                "-movflags",
-                "+faststart",
-                temporaryMp4Path,
-              ],
-              { timeoutMs: timeout(DEFAULT_MEDIA_COMMAND_TIMEOUT_MS, "MP4 finalization") },
-            ),
-          );
-          if (!(await fileIsNonempty(temporaryMp4Path))) {
-            throw new Error("Final MP4 remux produced no file");
-          }
-          await verifyFinalMp4(
-            config,
-            temporaryMp4Path,
-            timeout(DEFAULT_MEDIA_COMMAND_TIMEOUT_MS, "MP4 verification"),
-          );
-          await rename(temporaryMp4Path, state.finalMp4Path);
-        } finally {
-          await unlink(temporaryMp4Path).catch((error: unknown) => {
-            if (!hasCode(error, "ENOENT")) throw error;
-          });
-        }
-        if (config.upload !== undefined) {
-          state = await updateState(state, { phase: "uploading_mp4" });
-          const publication = await uploadFinalMp4({
-            filePath: state.finalMp4Path,
-            key: config.upload.key,
-            ...(config.upload.workspace === undefined
-              ? {}
-              : { workspace: config.upload.workspace }),
-            ...(config.upload.executable === undefined
-              ? {}
-              : { executable: config.upload.executable }),
-            timeoutMs: timeout(DEFAULT_MEDIA_COMMAND_TIMEOUT_MS, "MP4 upload"),
-          });
-          state = await updateState(state, { publication });
-        }
-      } else if (control.captureStarted) {
-        failure ??= "Recording supervisor stopped without producing an HLS playlist";
-      }
-    }
+    const produced = await producePhase(config, state, control, captureStopped, timeout, warnings);
+    state = produced.state;
+    failure ??= produced.failure;
     if (config.upload !== undefined && state.publication === undefined) {
       failure ??= "Recording finished without an uploaded MP4";
     }
@@ -721,11 +756,98 @@ async function finalizeRecording(
   return { state, ...(failure === undefined ? {} : { failure }) };
 }
 
-function managedProcessControl(processes: {
-  readonly xvfb?: ManagedProcess;
-  readonly openbox?: ManagedProcess;
-  readonly ffmpeg?: ManagedProcess;
-}): FinalizationProcessControl {
+async function closeBrowserPhase(
+  config: NormalizedSessionConfig,
+  initialState: RecordingSessionState,
+  attempt: FinalizationAttempt,
+): Promise<RecordingSessionState> {
+  if (!browserCleanupRequired(initialState) || initialState.browserClosedAt !== undefined) {
+    return initialState;
+  }
+  const state = await updateState(initialState, { phase: "closing_browser" });
+  const browserClosed = await attempt("agent-browser cleanup", config.stopTimeoutMs, (timeoutMs) =>
+    closeAgentBrowser(config, state, timeoutMs),
+  );
+  return browserClosed ? updateState(state, { browserClosedAt: new Date().toISOString() }) : state;
+}
+
+async function producePhase(
+  config: NormalizedSessionConfig,
+  state: RecordingSessionState,
+  control: FinalizationProcessControl,
+  captureStopped: boolean,
+  timeout: FinalizationTimeout,
+  warnings: string[],
+): Promise<FinalizationResult> {
+  if (!captureStopped || state.publication !== undefined) return { state };
+  if (await fileIsNonempty(state.playlistPath)) {
+    return { state: await produceAndPublishMp4(config, state, timeout, warnings) };
+  }
+  return control.captureStarted
+    ? { state, failure: "Recording supervisor stopped without producing an HLS playlist" }
+    : { state };
+}
+
+/** Remux the HLS capture into one verified MP4, then upload it when configured. */
+async function produceAndPublishMp4(
+  config: NormalizedSessionConfig,
+  initialState: RecordingSessionState,
+  timeout: FinalizationTimeout,
+  warnings: string[],
+): Promise<RecordingSessionState> {
+  let state = await updateState(initialState, { phase: "finalizing_mp4" });
+  const temporaryMp4Path = join(state.runtimeDirectory, `.recording-${randomUUID()}.tmp.mp4`);
+  try {
+    requireSuccess(
+      "final MP4 remux",
+      await runExact(
+        [
+          config.executables.ffmpeg,
+          "-y",
+          "-v",
+          "error",
+          "-i",
+          state.playlistPath,
+          "-c",
+          "copy",
+          "-movflags",
+          "+faststart",
+          temporaryMp4Path,
+        ],
+        { timeoutMs: timeout(DEFAULT_MEDIA_COMMAND_TIMEOUT_MS, "MP4 finalization") },
+      ),
+    );
+    if (!(await fileIsNonempty(temporaryMp4Path))) {
+      throw new Error("Final MP4 remux produced no file");
+    }
+    await verifyFinalMp4(
+      config,
+      temporaryMp4Path,
+      timeout(DEFAULT_MEDIA_COMMAND_TIMEOUT_MS, "MP4 verification"),
+    );
+    await rename(temporaryMp4Path, state.finalMp4Path);
+  } finally {
+    await unlink(temporaryMp4Path).catch((error: unknown) => {
+      if (!hasCode(error, "ENOENT")) {
+        warnings.push(`temporary MP4 cleanup: ${errorMessage(error)}`);
+      }
+    });
+  }
+  if (config.upload !== undefined) {
+    state = await updateState(state, { phase: "uploading_mp4" });
+    const publication = await uploadFinalMp4({
+      filePath: state.finalMp4Path,
+      key: config.upload.key,
+      ...(config.upload.workspace === undefined ? {} : { workspace: config.upload.workspace }),
+      ...(config.upload.executable === undefined ? {} : { executable: config.upload.executable }),
+      timeoutMs: timeout(DEFAULT_MEDIA_COMMAND_TIMEOUT_MS, "MP4 upload"),
+    });
+    state = await updateState(state, { publication });
+  }
+  return state;
+}
+
+function managedProcessControl(processes: SuperviseProcesses): FinalizationProcessControl {
   return {
     captureStarted: processes.ffmpeg !== undefined,
     stopCapture: async (timeoutMs) => {
@@ -768,15 +890,7 @@ async function recoverSession(
   let state = await readState(runtimeDirectory);
   if (state === null) throw new Error("Recording state disappeared during stop");
   const config = await readSessionConfig(runtimeDirectory);
-  if (
-    !isActive(state.phase) &&
-    !(await hasLiveOwnedProcess(state)) &&
-    !(await hasOwnedDisplayLock(state)) &&
-    browserCleanupComplete(state) &&
-    publicationComplete(state, config)
-  ) {
-    return state;
-  }
+  if (await isFullyReleased(state, config)) return state;
   const retryingTerminalState = !isActive(state.phase);
   const warnings: string[] = [];
   const finalized = await finalizeRecording(
@@ -798,14 +912,7 @@ async function recoverSession(
     const { failure: _failure, warnings: _warnings, ...cleanState } = state;
     state = cleanState;
   }
-  const now = new Date().toISOString();
-  return updateState(state, {
-    phase: failure === undefined ? "finished" : "failed",
-    ...(failure === undefined ? {} : { failure }),
-    ...(warnings.length === 0 ? {} : { warnings }),
-    updatedAt: now,
-    finishedAt: now,
-  });
+  return finishState(state, failure, warnings);
 }
 
 async function closeAgentBrowser(
@@ -860,35 +967,7 @@ async function verifyFinalMp4(
     { timeoutMs },
   );
   requireSuccess("final MP4 probe", probe);
-  const parsed = parseObject(probe.stdout, "ffprobe output");
-  const stream =
-    Array.isArray(parsed.streams) && parsed.streams.length === 1 ? parsed.streams[0] : undefined;
-  const format = parsed.format;
-  if (
-    typeof stream !== "object" ||
-    stream === null ||
-    typeof format !== "object" ||
-    format === null
-  ) {
-    throw new Error("Final MP4 is missing its video stream or duration");
-  }
-  const video = stream as Record<string, unknown>;
-  const container = format as Record<string, unknown>;
-  const measuredFps = parseFrameRate(video.avg_frame_rate);
-  const frames = typeof video.nb_frames === "string" ? Number(video.nb_frames) : Number.NaN;
-  const duration = typeof container.duration === "string" ? Number(container.duration) : Number.NaN;
-  if (
-    video.codec_name !== "h264" ||
-    video.pix_fmt !== "yuv420p" ||
-    video.width !== config.width ||
-    video.height !== config.height ||
-    measuredFps === null ||
-    Math.abs(measuredFps - config.fps) > 0.01 ||
-    !Number.isSafeInteger(frames) ||
-    frames <= 0 ||
-    !Number.isFinite(duration) ||
-    duration <= 0
-  ) {
+  if (!matchesRequestedFormat(probeReport(probe.stdout), config)) {
     throw new Error("Final MP4 does not match the requested H.264/yuv420p geometry and FPS");
   }
   const decode = await runExact(
@@ -896,6 +975,40 @@ async function verifyFinalMp4(
     { timeoutMs },
   );
   requireSuccess("final MP4 decode", decode);
+}
+
+interface ProbeReport {
+  readonly video: Record<string, unknown>;
+  readonly container: Record<string, unknown>;
+}
+
+function probeReport(stdout: string): ProbeReport {
+  const parsed = parseObject(stdout, "ffprobe output");
+  const stream =
+    Array.isArray(parsed.streams) && parsed.streams.length === 1 ? parsed.streams[0] : undefined;
+  if (!isRecord(stream) || !isRecord(parsed.format)) {
+    throw new Error("Final MP4 is missing its video stream or duration");
+  }
+  return { video: stream, container: parsed.format };
+}
+
+function matchesRequestedFormat(report: ProbeReport, config: NormalizedSessionConfig): boolean {
+  const { video, container } = report;
+  const measuredFps = parseFrameRate(video.avg_frame_rate);
+  const frames = typeof video.nb_frames === "string" ? Number(video.nb_frames) : Number.NaN;
+  const duration = typeof container.duration === "string" ? Number(container.duration) : Number.NaN;
+  return (
+    video.codec_name === "h264" &&
+    video.pix_fmt === "yuv420p" &&
+    video.width === config.width &&
+    video.height === config.height &&
+    measuredFps !== null &&
+    Math.abs(measuredFps - config.fps) <= 0.01 &&
+    Number.isSafeInteger(frames) &&
+    frames > 0 &&
+    Number.isFinite(duration) &&
+    duration > 0
+  );
 }
 
 function parseFrameRate(value: unknown): number | null {
@@ -908,18 +1021,7 @@ function parseFrameRate(value: unknown): number | null {
   return numerator / denominator;
 }
 
-function sessionPaths(runtimeDirectory: string): {
-  readonly captureDirectory: string;
-  readonly playlistPath: string;
-  readonly segmentPattern: string;
-  readonly finalMp4Path: string;
-  readonly xauthorityPath: string;
-  readonly supervisorLogPath: string;
-  readonly xvfbLogPath: string;
-  readonly openboxLogPath: string;
-  readonly ffmpegLogPath: string;
-  readonly ffmpegProgressPath: string;
-} {
+function sessionPaths(runtimeDirectory: string): SessionPaths {
   const captureDirectory = join(runtimeDirectory, "capture");
   return {
     captureDirectory,
@@ -935,57 +1037,73 @@ function sessionPaths(runtimeDirectory: string): {
   };
 }
 
-function normalizeOptions(options: StartSessionOptions): NormalizedSessionConfig {
-  const runtimeDirectory = validateRuntimeDirectory(options.runtimeDirectory);
-  const width = positiveInteger(options.width, "width");
-  const height = positiveInteger(options.height, "height");
-  if (width > 16_384 || height > 16_384) throw new Error("Capture dimensions are too large");
-  if (options.fps !== 30 && options.fps !== 60) throw new Error("fps must be 30 or 60");
-  const segmentDurationSeconds = positiveInteger(
-    options.segmentDurationSeconds ?? 10,
-    "segmentDurationSeconds",
-  );
-  const startupTimeoutMs = positiveInteger(
-    options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS,
-    "startupTimeoutMs",
-  );
-  const stopTimeoutMs = positiveInteger(
-    options.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS,
-    "stopTimeoutMs",
-  );
-  const initialUrl = validateInitialUrl(options.initialUrl ?? "about:blank");
-  const displayNumber =
-    options.displayNumber === undefined
-      ? undefined
-      : positiveInteger(options.displayNumber, "displayNumber");
-  if (displayNumber !== undefined && displayNumber > 65_535) {
-    throw new Error("displayNumber must not exceed 65535");
+const EXECUTABLE_DEFAULTS: Required<RecordingExecutables> = {
+  agentBrowser: "agent-browser",
+  ffmpeg: "ffmpeg",
+  ffprobe: "ffprobe",
+  mcookie: "mcookie",
+  openbox: "openbox",
+  xauth: "xauth",
+  xdpyinfo: "xdpyinfo",
+  xprop: "xprop",
+  xvfb: "Xvfb",
+};
+
+const EXECUTABLE_NAMES = Object.keys(
+  EXECUTABLE_DEFAULTS,
+) as readonly (keyof Required<RecordingExecutables>)[];
+
+function normalizeExecutables(overrides: RecordingExecutables): Required<RecordingExecutables> {
+  const named = { ...EXECUTABLE_DEFAULTS };
+  for (const name of EXECUTABLE_NAMES) {
+    named[name] = executable(overrides[name] ?? EXECUTABLE_DEFAULTS[name]);
   }
-  const executables: Required<RecordingExecutables> = {
-    agentBrowser: executable(options.executables?.agentBrowser ?? "agent-browser"),
-    ffmpeg: executable(options.executables?.ffmpeg ?? "ffmpeg"),
-    ffprobe: executable(options.executables?.ffprobe ?? "ffprobe"),
-    mcookie: executable(options.executables?.mcookie ?? "mcookie"),
-    openbox: executable(options.executables?.openbox ?? "openbox"),
-    xauth: executable(options.executables?.xauth ?? "xauth"),
-    xdpyinfo: executable(options.executables?.xdpyinfo ?? "xdpyinfo"),
-    xprop: executable(options.executables?.xprop ?? "xprop"),
-    xvfb: executable(options.executables?.xvfb ?? "Xvfb"),
-  };
+  return named;
+}
+
+function normalizeOptions(options: StartSessionOptions): NormalizedSessionConfig {
+  const displayNumber = normalizeDisplayNumber(options.displayNumber);
   return {
     id: validateRecordingId(options.recordingId ?? randomUUID()),
-    runtimeDirectory,
-    width,
-    height,
-    fps: options.fps,
-    segmentDurationSeconds,
-    initialUrl,
+    runtimeDirectory: validateRuntimeDirectory(options.runtimeDirectory),
+    width: captureDimension(options.width, "width"),
+    height: captureDimension(options.height, "height"),
+    fps: validateFps(options.fps),
+    segmentDurationSeconds: positiveInteger(
+      options.segmentDurationSeconds ?? 10,
+      "segmentDurationSeconds",
+    ),
+    initialUrl: validateInitialUrl(options.initialUrl ?? "about:blank"),
     ...(displayNumber === undefined ? {} : { displayNumber }),
-    startupTimeoutMs,
-    stopTimeoutMs,
-    executables,
+    startupTimeoutMs: positiveInteger(
+      options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS,
+      "startupTimeoutMs",
+    ),
+    stopTimeoutMs: positiveInteger(
+      options.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS,
+      "stopTimeoutMs",
+    ),
+    executables: normalizeExecutables(options.executables ?? {}),
     ...(options.upload === undefined ? {} : { upload: normalizeUpload(options.upload) }),
   };
+}
+
+function captureDimension(value: number, label: string): number {
+  const dimension = positiveInteger(value, label);
+  if (dimension > 16_384) throw new Error("Capture dimensions are too large");
+  return dimension;
+}
+
+function validateFps(value: number): 30 | 60 {
+  if (value !== 30 && value !== 60) throw new Error("fps must be 30 or 60");
+  return value;
+}
+
+function normalizeDisplayNumber(value: number | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const displayNumber = positiveInteger(value, "displayNumber");
+  if (displayNumber > 65_535) throw new Error("displayNumber must not exceed 65535");
+  return displayNumber;
 }
 
 function validateRecordingId(value: string): string {
@@ -1081,14 +1199,7 @@ async function waitForStarted(
   while (Date.now() < deadline) {
     if (state.phase === "recording" || !isActive(state.phase)) return state;
     if (!(await identityIsAlive(state.supervisor))) {
-      const now = new Date().toISOString();
-      const failed = await updateState(state, {
-        phase: "failed",
-        failure: "Recording supervisor exited during startup",
-        updatedAt: now,
-        finishedAt: now,
-      });
-      return failed;
+      return finishState(state, "Recording supervisor exited during startup", []);
     }
     await delay(50);
     state = (await readState(state.runtimeDirectory)) ?? state;
@@ -1168,48 +1279,78 @@ async function updateState(
   return next;
 }
 
+const STATE_STRING_FIELDS = [
+  "id",
+  "display",
+  "xauthorityPath",
+  "displayLockPath",
+  "playlistPath",
+  "segmentPattern",
+  "finalMp4Path",
+  "supervisorLogPath",
+  "agentBrowserSession",
+  "agentBrowserNamespace",
+  "startedAt",
+  "updatedAt",
+] as const;
+
+const STATE_CONTAINED_PATH_FIELDS = [
+  "xauthorityPath",
+  "playlistPath",
+  "segmentPattern",
+  "finalMp4Path",
+  "supervisorLogPath",
+] as const;
+
+const STATE_OPTIONAL_STRING_FIELDS = [
+  "failure",
+  "finishedAt",
+  "browserClosedAt",
+  "browserStartAttemptedAt",
+] as const;
+
+type RawSessionState = Record<string, unknown> &
+  Record<(typeof STATE_STRING_FIELDS)[number], string> & {
+    readonly phase: RecordingSessionPhase;
+    readonly supervisor: OwnedProcessIdentity;
+  };
+
 function parseState(source: string, runtimeDirectory: string): RecordingSessionState {
   const parsed = parseObject(source, "recording state");
-  if (
-    parsed.schemaVersion !== SESSION_SCHEMA_VERSION ||
-    typeof parsed.id !== "string" ||
-    !isPhase(parsed.phase) ||
-    parsed.runtimeDirectory !== runtimeDirectory ||
-    typeof parsed.display !== "string" ||
-    typeof parsed.xauthorityPath !== "string" ||
-    typeof parsed.displayLockPath !== "string" ||
-    typeof parsed.playlistPath !== "string" ||
-    typeof parsed.segmentPattern !== "string" ||
-    typeof parsed.finalMp4Path !== "string" ||
-    typeof parsed.supervisorLogPath !== "string" ||
-    typeof parsed.agentBrowserSession !== "string" ||
-    typeof parsed.agentBrowserNamespace !== "string" ||
-    !isPositiveInteger(parsed.width) ||
-    !isPositiveInteger(parsed.height) ||
-    (parsed.fps !== 30 && parsed.fps !== 60) ||
-    !isPositiveInteger(parsed.segmentDurationSeconds) ||
-    !isIdentity(parsed.supervisor) ||
-    !Array.isArray(parsed.phaseHistory) ||
-    !parsed.phaseHistory.every(
-      (entry) =>
-        typeof entry === "object" &&
-        entry !== null &&
-        isPhase((entry as Record<string, unknown>).phase) &&
-        typeof (entry as Record<string, unknown>).at === "string",
-    ) ||
-    typeof parsed.startedAt !== "string" ||
-    typeof parsed.updatedAt !== "string"
-  ) {
+  if (!hasStateShape(parsed) || parsed.runtimeDirectory !== runtimeDirectory) {
     throw new Error("Invalid recording state");
   }
-  for (const path of [
-    parsed.xauthorityPath,
-    parsed.playlistPath,
-    parsed.segmentPattern,
-    parsed.finalMp4Path,
-    parsed.supervisorLogPath,
-  ]) {
-    assertWithin(runtimeDirectory, path);
+  assertStatePaths(parsed, runtimeDirectory);
+  assertStateOptionals(parsed);
+  return parsed as unknown as RecordingSessionState;
+}
+
+function hasStateShape(parsed: Record<string, unknown>): parsed is RawSessionState {
+  return (
+    parsed.schemaVersion === SESSION_SCHEMA_VERSION &&
+    isPhase(parsed.phase) &&
+    STATE_STRING_FIELDS.every((field) => typeof parsed[field] === "string") &&
+    isPositiveInteger(parsed.width) &&
+    isPositiveInteger(parsed.height) &&
+    (parsed.fps === 30 || parsed.fps === 60) &&
+    isPositiveInteger(parsed.segmentDurationSeconds) &&
+    isIdentity(parsed.supervisor) &&
+    isPhaseHistory(parsed.phaseHistory)
+  );
+}
+
+function isPhaseHistory(
+  value: unknown,
+): value is readonly { readonly phase: RecordingSessionPhase; readonly at: string }[] {
+  return (
+    Array.isArray(value) &&
+    value.every((entry) => isRecord(entry) && isPhase(entry.phase) && typeof entry.at === "string")
+  );
+}
+
+function assertStatePaths(parsed: RawSessionState, runtimeDirectory: string): void {
+  for (const field of STATE_CONTAINED_PATH_FIELDS) {
+    assertWithin(runtimeDirectory, parsed[field]);
   }
   if (
     !/^:\d+$/u.test(parsed.display) ||
@@ -1217,81 +1358,52 @@ function parseState(source: string, runtimeDirectory: string): RecordingSessionS
   ) {
     throw new Error("Invalid recording display ownership state");
   }
-  for (const process of [parsed.xvfb, parsed.openbox, parsed.ffmpeg]) {
-    if (process !== undefined && !isIdentity(process))
-      throw new Error("Invalid owned process state");
+}
+
+function assertStateOptionals(parsed: RawSessionState): void {
+  for (const owned of [parsed.xvfb, parsed.openbox, parsed.ffmpeg]) {
+    if (owned !== undefined && !isIdentity(owned)) throw new Error("Invalid owned process state");
   }
-  if (parsed.failure !== undefined && typeof parsed.failure !== "string") {
-    throw new Error("Invalid recording failure state");
+  for (const field of STATE_OPTIONAL_STRING_FIELDS) {
+    if (parsed[field] !== undefined && typeof parsed[field] !== "string") {
+      throw new Error(`Invalid recording state: ${field}`);
+    }
   }
-  if (
-    parsed.warnings !== undefined &&
-    (!Array.isArray(parsed.warnings) ||
-      !parsed.warnings.every((value) => typeof value === "string"))
-  ) {
+  if (parsed.warnings !== undefined && !isStringArray(parsed.warnings)) {
     throw new Error("Invalid recording warning state");
-  }
-  if (parsed.finishedAt !== undefined && typeof parsed.finishedAt !== "string") {
-    throw new Error("Invalid recording completion state");
-  }
-  if (parsed.browserClosedAt !== undefined && typeof parsed.browserClosedAt !== "string") {
-    throw new Error("Invalid browser cleanup state");
-  }
-  if (
-    parsed.browserStartAttemptedAt !== undefined &&
-    typeof parsed.browserStartAttemptedAt !== "string"
-  ) {
-    throw new Error("Invalid browser startup state");
   }
   if (parsed.publication !== undefined && !isPublication(parsed.publication)) {
     throw new Error("Invalid recording publication state");
   }
-  return parsed as unknown as RecordingSessionState;
+}
+
+interface RawSessionConfig {
+  readonly id: string;
+  readonly runtimeDirectory: string;
+  readonly width: number;
+  readonly height: number;
+  readonly fps: 30 | 60;
+  readonly segmentDurationSeconds: number;
+  readonly initialUrl: string;
+  readonly displayNumber?: unknown;
+  readonly upload?: unknown;
+  readonly startupTimeoutMs: number;
+  readonly stopTimeoutMs: number;
+  readonly executables: Required<RecordingExecutables>;
 }
 
 function parseConfig(source: string, configPath: string): NormalizedSessionConfig {
   const parsed = parseObject(source, "recording config");
-  if (
-    typeof parsed.id !== "string" ||
-    typeof parsed.runtimeDirectory !== "string" ||
-    !isPositiveInteger(parsed.width) ||
-    !isPositiveInteger(parsed.height) ||
-    (parsed.fps !== 30 && parsed.fps !== 60) ||
-    !isPositiveInteger(parsed.segmentDurationSeconds) ||
-    typeof parsed.initialUrl !== "string" ||
-    !isPositiveInteger(parsed.startupTimeoutMs) ||
-    !isPositiveInteger(parsed.stopTimeoutMs) ||
-    !isExecutableRecord(parsed.executables)
-  ) {
-    throw new Error("Invalid recording config");
-  }
+  if (!hasConfigShape(parsed)) throw new Error("Invalid recording config");
   const runtimeDirectory = validateRuntimeDirectory(parsed.runtimeDirectory);
   if (join(runtimeDirectory, CONFIG_NAME) !== configPath) {
     throw new Error("Recording config is outside its runtime directory");
   }
-  if (parsed.displayNumber !== undefined && !isPositiveInteger(parsed.displayNumber)) {
-    throw new Error("Invalid recording display number");
-  }
-  if (typeof parsed.displayNumber === "number" && parsed.displayNumber > 65_535) {
-    throw new Error("Invalid recording display number");
-  }
+  const displayNumber = parseConfigDisplayNumber(parsed.displayNumber);
   if (parsed.upload !== undefined && !isUploadConfig(parsed.upload)) {
     throw new Error("Invalid recording upload config");
   }
   validateRecordingId(parsed.id);
-  const initialUrl = validateInitialUrl(parsed.initialUrl);
-  const executables = {
-    agentBrowser: executable(parsed.executables.agentBrowser),
-    ffmpeg: executable(parsed.executables.ffmpeg),
-    ffprobe: executable(parsed.executables.ffprobe),
-    mcookie: executable(parsed.executables.mcookie),
-    openbox: executable(parsed.executables.openbox),
-    xauth: executable(parsed.executables.xauth),
-    xdpyinfo: executable(parsed.executables.xdpyinfo),
-    xprop: executable(parsed.executables.xprop),
-    xvfb: executable(parsed.executables.xvfb),
-  };
-  const upload = parsed.upload === undefined ? undefined : normalizeUpload(parsed.upload);
   return {
     id: parsed.id,
     runtimeDirectory,
@@ -1299,13 +1411,38 @@ function parseConfig(source: string, configPath: string): NormalizedSessionConfi
     height: parsed.height,
     fps: parsed.fps,
     segmentDurationSeconds: parsed.segmentDurationSeconds,
-    initialUrl,
-    ...(parsed.displayNumber === undefined ? {} : { displayNumber: parsed.displayNumber }),
+    initialUrl: validateInitialUrl(parsed.initialUrl),
+    ...(displayNumber === undefined ? {} : { displayNumber }),
     startupTimeoutMs: parsed.startupTimeoutMs,
     stopTimeoutMs: parsed.stopTimeoutMs,
-    executables,
-    ...(upload === undefined ? {} : { upload }),
+    executables: normalizeExecutables(parsed.executables),
+    ...(parsed.upload === undefined ? {} : { upload: normalizeUpload(parsed.upload) }),
   };
+}
+
+function hasConfigShape(
+  parsed: Record<string, unknown>,
+): parsed is Record<string, unknown> & RawSessionConfig {
+  return (
+    typeof parsed.id === "string" &&
+    typeof parsed.runtimeDirectory === "string" &&
+    isPositiveInteger(parsed.width) &&
+    isPositiveInteger(parsed.height) &&
+    (parsed.fps === 30 || parsed.fps === 60) &&
+    isPositiveInteger(parsed.segmentDurationSeconds) &&
+    typeof parsed.initialUrl === "string" &&
+    isPositiveInteger(parsed.startupTimeoutMs) &&
+    isPositiveInteger(parsed.stopTimeoutMs) &&
+    isExecutableRecord(parsed.executables)
+  );
+}
+
+function parseConfigDisplayNumber(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  if (!isPositiveInteger(value) || value > 65_535) {
+    throw new Error("Invalid recording display number");
+  }
+  return value;
 }
 
 function parseObject(source: string, label: string): Record<string, unknown> {
@@ -1518,14 +1655,7 @@ async function failStopAtDeadline(
       warnings.push(`${owned.executable} emergency cleanup: ${errorMessage(error)}`);
     });
   }
-  const now = new Date().toISOString();
-  state = await updateState(state, {
-    phase: "failed",
-    failure,
-    ...(warnings.length === 0 ? {} : { warnings }),
-    updatedAt: now,
-    finishedAt: now,
-  });
+  state = await finishState(state, failure, warnings);
   return {
     exists: true,
     supervisorAlive: await identityIsAlive(state.supervisor),
@@ -1727,67 +1857,64 @@ function isActive(phase: RecordingSessionPhase): boolean {
   return phase !== "finished" && phase !== "failed";
 }
 
+const RECORDING_PHASES: ReadonlySet<string> = new Set([
+  "starting",
+  "recording",
+  ...RECORDING_STOP_PHASES,
+  "finished",
+  "failed",
+]);
+
 function isPhase(value: unknown): value is RecordingSessionPhase {
-  return new Set([
-    "starting",
-    "recording",
-    "closing_browser",
-    "stopping_capture",
-    "finalizing_mp4",
-    "uploading_mp4",
-    "cleaning_up",
-    "finished",
-    "failed",
-  ]).has(value as string);
+  return typeof value === "string" && RECORDING_PHASES.has(value);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isStringArray(value: unknown): value is readonly string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
 }
 
 function isIdentity(value: unknown): value is OwnedProcessIdentity {
   return (
-    typeof value === "object" &&
-    value !== null &&
-    isPositiveInteger((value as Record<string, unknown>).pid) &&
-    typeof (value as Record<string, unknown>).startTimeTicks === "string" &&
-    /^\d+$/u.test((value as Record<string, unknown>).startTimeTicks as string) &&
-    typeof (value as Record<string, unknown>).executable === "string" &&
-    ((value as Record<string, unknown>).executable as string).length > 0 &&
-    !((value as Record<string, unknown>).executable as string).includes("\0")
+    isRecord(value) &&
+    isPositiveInteger(value.pid) &&
+    typeof value.startTimeTicks === "string" &&
+    /^\d+$/u.test(value.startTimeTicks) &&
+    typeof value.executable === "string" &&
+    value.executable.length > 0 &&
+    !value.executable.includes("\0")
   );
 }
 
 function isPublication(value: unknown): value is UploadsPublication {
-  if (typeof value !== "object" || value === null) return false;
-  const record = value as Record<string, unknown>;
   return (
-    typeof record.key === "string" &&
-    typeof record.url === "string" &&
-    record.contentType === "video/mp4" &&
-    isPositiveInteger(record.sizeBytes)
+    isRecord(value) &&
+    typeof value.key === "string" &&
+    typeof value.url === "string" &&
+    value.contentType === "video/mp4" &&
+    isPositiveInteger(value.sizeBytes)
   );
 }
 
 function isExecutableRecord(value: unknown): value is Required<RecordingExecutables> {
-  if (typeof value !== "object" || value === null) return false;
-  const record = value as Record<string, unknown>;
-  return [
-    "agentBrowser",
-    "ffmpeg",
-    "ffprobe",
-    "mcookie",
-    "openbox",
-    "xauth",
-    "xdpyinfo",
-    "xprop",
-    "xvfb",
-  ].every((name) => typeof record[name] === "string" && (record[name] as string).length > 0);
+  return (
+    isRecord(value) &&
+    EXECUTABLE_NAMES.every((name) => {
+      const entry = value[name];
+      return typeof entry === "string" && entry.length > 0;
+    })
+  );
 }
 
 function isUploadConfig(value: unknown): value is RecordingUploadOptions {
-  if (typeof value !== "object" || value === null) return false;
-  const record = value as Record<string, unknown>;
   return (
-    typeof record.key === "string" &&
-    (record.workspace === undefined || typeof record.workspace === "string") &&
-    (record.executable === undefined || typeof record.executable === "string")
+    isRecord(value) &&
+    typeof value.key === "string" &&
+    (value.workspace === undefined || typeof value.workspace === "string") &&
+    (value.executable === undefined || typeof value.executable === "string")
   );
 }
 

@@ -1,0 +1,14 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "rules": {
+    "eslint/complexity": ["error", { "max": 12 }]
+  },
+  "overrides": [
+    {
+      "files": ["benchmarks/**"],
+      "rules": {
+        "eslint/complexity": "off"
+      }
+    }
+  ]
+}

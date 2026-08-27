@@ -1,6 +1,6 @@
 import { stat } from "node:fs/promises";
 
-import { runExact } from "./process.js";
+import { runExact, type ExactCommandResult } from "./process.js";
 
 const OUTPUT_LIMIT_BYTES = 1_000_000;
 const DEFAULT_TIMEOUT_MS = 5 * 60_000;
@@ -28,11 +28,7 @@ export interface UploadsPublication {
 export async function uploadFinalMp4(options: UploadFinalMp4Options): Promise<UploadsPublication> {
   assertUploadsKey(options.key);
   if (options.workspace !== undefined) assertUploadsWorkspace(options.workspace);
-  const source = await stat(options.filePath);
-  if (!source.isFile() || !Number.isSafeInteger(source.size) || source.size <= 0) {
-    throw new Error("Final MP4 must be a non-empty regular file");
-  }
-
+  const sizeBytes = await sourceFileSize(options.filePath);
   const environment = uploadsEnvironment(options.environment ?? process.env, options.workspace);
   const workspaceArgs = options.workspace === undefined ? [] : ["--workspace", options.workspace];
   const result = await runExact(
@@ -60,17 +56,8 @@ export async function uploadFinalMp4(options: UploadFinalMp4Options): Promise<Up
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     },
   );
-  if (result.exitCode !== 0) {
-    const termination =
-      result.error ??
-      (result.exitCode === null
-        ? `terminated by ${result.signal ?? "an unknown signal"}`
-        : `exited ${result.exitCode}`);
-    throw new Error(
-      `uploads put ${termination}: ${safeDetail(result.stderr || result.stdout, environment)}`,
-    );
-  }
-  const publication = parseUploadsPublication(result.stdout, options.key, source.size);
+  if (result.exitCode !== 0) throw uploadFailure(result, environment);
+  const publication = parseUploadsPublication(result.stdout, options.key, sizeBytes);
   await verifyHostedPublication(
     publication,
     Math.min(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, 10_000),
@@ -105,20 +92,8 @@ export function parseUploadsPublication(
     throw new Error("uploads put response is missing its URL");
   }
   const url = parsePublicUrl(parsed.url);
-  if (
-    parsed.size !== undefined &&
-    parsed.size !== null &&
-    (!Number.isSafeInteger(parsed.size) || parsed.size !== expectedSizeBytes)
-  ) {
-    throw new Error("uploads put returned an unexpected file size");
-  }
-  if (
-    parsed.sizeBytes !== undefined &&
-    parsed.sizeBytes !== null &&
-    (!Number.isSafeInteger(parsed.sizeBytes) || parsed.sizeBytes !== expectedSizeBytes)
-  ) {
-    throw new Error("uploads put returned an unexpected file size");
-  }
+  assertReportedSize(parsed.size, expectedSizeBytes);
+  assertReportedSize(parsed.sizeBytes, expectedSizeBytes);
   return {
     key: expectedKey,
     url,
@@ -141,6 +116,32 @@ export function assertUploadsKey(key: string): void {
 export function assertUploadsWorkspace(workspace: string): void {
   if (!SAFE_WORKSPACE.test(workspace)) {
     throw new Error(`Invalid uploads.sh workspace: ${JSON.stringify(workspace)}`);
+  }
+}
+
+async function sourceFileSize(filePath: string): Promise<number> {
+  const source = await stat(filePath);
+  if (!source.isFile() || !Number.isSafeInteger(source.size) || source.size <= 0) {
+    throw new Error("Final MP4 must be a non-empty regular file");
+  }
+  return source.size;
+}
+
+function uploadFailure(result: ExactCommandResult, environment: NodeJS.ProcessEnv): Error {
+  const termination =
+    result.error ??
+    (result.exitCode === null
+      ? `terminated by ${result.signal ?? "an unknown signal"}`
+      : `exited ${result.exitCode}`);
+  return new Error(
+    `uploads put ${termination}: ${safeDetail(result.stderr || result.stdout, environment)}`,
+  );
+}
+
+function assertReportedSize(value: unknown, expectedSizeBytes: number): void {
+  if (value === undefined || value === null) return;
+  if (!Number.isSafeInteger(value) || value !== expectedSizeBytes) {
+    throw new Error("uploads put returned an unexpected file size");
   }
 }
 

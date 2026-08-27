@@ -109,45 +109,46 @@ const COMMANDS = [
   },
 ] as const;
 
+const INFO_COMMANDS = new Map<string, { readonly label: string; readonly payload: () => object }>([
+  ["--help", { label: "help", payload: helpPayload }],
+  ["help", { label: "help", payload: helpPayload }],
+  ["manifest", { label: "help", payload: helpPayload }],
+  ["--brief", { label: "brief", payload: () => ({ brief: brief() }) }],
+  ["--version", { label: "version", payload: () => ({ version: CLI_VERSION }) }],
+]);
+
+const SUBCOMMANDS = new Map<string, (argv: readonly string[]) => Promise<number>>([
+  ["start", startCommand],
+  ["status", statusCommand],
+  ["stop", stopCommand],
+]);
+
 async function main(argv: readonly string[]): Promise<number> {
   const command = argv[0];
   if (command === undefined) {
     writeSuccess(helpPayload(), "help", "none");
     return 0;
   }
-  if (command === "--help" || command === "help" || command === "manifest") {
-    if (argv.length !== 1)
-      return fail(new UsageError(`${command} does not accept arguments`), command);
-    writeSuccess(helpPayload(), "help", "none");
-    return 0;
-  }
-  if (command === "--brief") {
-    if (argv.length !== 1)
-      return fail(new UsageError("--brief does not accept arguments"), command);
-    writeSuccess({ brief: brief() }, "brief", "none");
-    return 0;
-  }
-  if (command === "--version") {
-    if (argv.length !== 1)
-      return fail(new UsageError("--version does not accept arguments"), command);
-    writeSuccess({ version: CLI_VERSION }, "version", "none");
-    return 0;
-  }
-  if (new Set(["start", "status", "stop"]).has(command) && argv[1] === "--help") {
-    if (argv.length !== 2)
-      return fail(new UsageError("--help does not accept other arguments"), command);
-    writeSuccess({ command: commandDefinition(command) }, `${command} --help`, "none");
-    return 0;
-  }
-
   try {
-    if (command === "start") return await startCommand(argv.slice(1));
-    if (command === "status") return await statusCommand(argv.slice(1));
-    if (command === "stop") return await stopCommand(argv.slice(1));
-    throw new UsageError(
-      `Unknown command: ${command}`,
-      "Run 'sandbox-video --help' and select a command from data.commands.",
-    );
+    const info = INFO_COMMANDS.get(command);
+    if (info !== undefined) {
+      if (argv.length !== 1) throw new UsageError(`${command} does not accept arguments`);
+      writeSuccess(info.payload(), info.label, "none");
+      return 0;
+    }
+    const run = SUBCOMMANDS.get(command);
+    if (run === undefined) {
+      throw new UsageError(
+        `Unknown command: ${command}`,
+        "Run 'sandbox-video --help' and select a command from data.commands.",
+      );
+    }
+    if (argv[1] === "--help") {
+      if (argv.length !== 2) throw new UsageError("--help does not accept other arguments");
+      writeSuccess({ command: commandDefinition(command) }, `${command} --help`, "none");
+      return 0;
+    }
+    return await run(argv.slice(1));
   } catch (error) {
     return fail(error, command);
   }
