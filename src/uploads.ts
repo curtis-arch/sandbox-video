@@ -214,12 +214,10 @@ async function verifyHostedPublication(
 
 function safeDetail(source: string, environment: NodeJS.ProcessEnv): string {
   let detail = source.trim() || "no error output";
-  for (const name of ["UPLOADS_TOKEN", "UPLOADS_SESSION_TOKEN"] as const) {
-    const value = environment[name];
-    if (value !== undefined && value.length > 0) detail = detail.replaceAll(value, "[REDACTED]");
-  }
-  for (const value of Object.values(environment)) {
-    if (value !== undefined && value.length >= 8) detail = detail.replaceAll(value, "[REDACTED]");
+  for (const [name, value] of Object.entries(environment)) {
+    if (/(?:TOKEN|SECRET|PASSWORD|AUTH)/iu.test(name) && value !== undefined && value.length > 0) {
+      detail = detail.replaceAll(value, "[REDACTED]");
+    }
   }
   return detail.slice(0, 1_000);
 }

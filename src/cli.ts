@@ -157,13 +157,11 @@ async function main(argv: readonly string[]): Promise<number> {
 async function startCommand(argv: readonly string[]): Promise<number> {
   const flags = parseFlags(argv, new Set(["fps", "size", "url", "uploads-workspace"]));
   const recordingId = randomUUID();
-  const fpsValue = integer(optionalFlag(flags, "fps") ?? String(DEFAULT_FPS), "--fps");
+  const fpsValue = integer(flags.get("fps") ?? String(DEFAULT_FPS), "--fps");
   if (fpsValue !== 30 && fpsValue !== 60) throw new UsageError("--fps must be 30 or 60");
-  const { width, height } = parseSize(
-    optionalFlag(flags, "size") ?? `${DEFAULT_WIDTH}x${DEFAULT_HEIGHT}`,
-  );
-  const workspace = optionalFlag(flags, "uploads-workspace") ?? process.env.UPLOADS_WORKSPACE;
-  const initialUrl = optionalFlag(flags, "url");
+  const { width, height } = parseSize(flags.get("size") ?? `${DEFAULT_WIDTH}x${DEFAULT_HEIGHT}`);
+  const workspace = flags.get("uploads-workspace") ?? process.env.UPLOADS_WORKSPACE;
+  const initialUrl = flags.get("url");
   const state = await startSession({
     recordingId,
     runtimeDirectory: runtimeDirectoryFor(recordingId),
@@ -175,6 +173,11 @@ async function startCommand(argv: readonly string[]): Promise<number> {
       key: `screenshots/sandbox-video/${recordingId}/proof.mp4`,
       ...(workspace === undefined ? {} : { workspace }),
     },
+  }).catch((error: unknown) => {
+    throw new CommandError(
+      `Recording ${recordingId} failed to start: ${error instanceof Error ? error.message : String(error)}`,
+      `Inspect /tmp/sandbox-video/${recordingId} for retained state and logs; run sandbox-video stop --recording-id ${recordingId} if a partial recording remains.`,
+    );
   });
   if (state.phase !== "recording")
     throw new Error(state.failure ?? `Recording startup ended in phase ${state.phase}`);
@@ -223,32 +226,31 @@ async function stopCommand(argv: readonly string[]): Promise<number> {
   const flags = parseFlags(argv, new Set(["recording-id", "timeout-ms"]));
   const recordingId = requiredFlag(flags, "recording-id");
   const timeoutMs = integer(
-    optionalFlag(flags, "timeout-ms") ?? String(DEFAULT_STOP_TIMEOUT_MS),
+    flags.get("timeout-ms") ?? String(DEFAULT_STOP_TIMEOUT_MS),
     "--timeout-ms",
   );
   const runtimeDirectory = runtimeDirectoryFor(recordingId);
   const initial = await getSessionStatus(runtimeDirectory);
   if (!initial.exists) throw new NotFoundError(recordingId);
   const stop = stopSession({ runtimeDirectory, timeoutMs });
-  void stop.catch(() => undefined);
+  let stopSettled = false;
+  const settle = () => {
+    stopSettled = true;
+  };
+  void stop.then(settle, settle);
   const seen = new Set<RecordingSessionPhase>();
   emitStopPhases(
     initial.state.phaseHistory.map((entry) => entry.phase),
     seen,
     recordingId,
   );
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const current = await getSessionStatus(runtimeDirectory);
-    if (!current.exists) break;
-    emitStopPhases(
-      current.state.phaseHistory.map((entry) => entry.phase),
-      seen,
-      recordingId,
-    );
-    if (current.state.phase === "finished" || current.state.phase === "failed") break;
-    await delay(POLL_INTERVAL_MS);
-  }
+  await pollStopProgress(
+    runtimeDirectory,
+    recordingId,
+    seen,
+    Date.now() + timeoutMs,
+    () => stopSettled,
+  );
   const result = await stop;
   if (!result.exists) throw new NotFoundError(recordingId);
   emitStopPhases(
@@ -267,6 +269,26 @@ async function stopCommand(argv: readonly string[]): Promise<number> {
   }
   writeSuccess(statusPayload(result), "stop", "proof-uploaded");
   return 0;
+}
+
+async function pollStopProgress(
+  runtimeDirectory: string,
+  recordingId: string,
+  seen: Set<RecordingSessionPhase>,
+  deadline: number,
+  stopSettled: () => boolean,
+): Promise<void> {
+  while (!stopSettled() && Date.now() < deadline) {
+    const current = await getSessionStatus(runtimeDirectory);
+    if (!current.exists) return;
+    emitStopPhases(
+      current.state.phaseHistory.map((entry) => entry.phase),
+      seen,
+      recordingId,
+    );
+    if (current.state.phase === "finished" || current.state.phase === "failed") return;
+    await delay(POLL_INTERVAL_MS);
+  }
 }
 
 function statusPayload(status: Extract<RecordingSessionStatus, { readonly exists: true }>): object {
@@ -357,9 +379,9 @@ function brief(): string {
 
 function runtimeDirectoryFor(recordingId: string): string {
   if (
-    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(recordingId)
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(recordingId)
   ) {
-    throw new UsageError("--recording-id must be a UUID");
+    throw new UsageError("--recording-id must be a lowercase UUID");
   }
   return join(RUNTIME_ROOT, recordingId);
 }
@@ -410,10 +432,6 @@ function requiredFlag(flags: ReadonlyMap<string, string>, name: string): string 
   if (value === undefined)
     throw new UsageError(`--${name} is required`, `Retry with --${name} followed by its value.`);
   return value;
-}
-
-function optionalFlag(flags: ReadonlyMap<string, string>, name: string): string | undefined {
-  return flags.get(name);
 }
 
 function fail(error: unknown, command: string): number {

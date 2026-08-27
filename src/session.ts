@@ -12,7 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { isAbsolute, join, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   assertUploadsKey,
@@ -238,6 +238,7 @@ export async function startSession(options: StartSessionOptions): Promise<Record
 
   const logPath = join(config.runtimeDirectory, SUPERVISOR_LOG_NAME);
   const log = await open(logPath, "a", 0o600);
+  let supervisor: OwnedProcessIdentity | null = null;
   try {
     const child = spawn(
       process.execPath,
@@ -250,6 +251,9 @@ export async function startSession(options: StartSessionOptions): Promise<Record
       },
     );
     await waitForSpawn(child);
+    if (child.pid !== undefined) {
+      supervisor = await processIdentity(child.pid, process.execPath).catch(() => null);
+    }
     child.unref();
   } catch (error) {
     await unlink(configPath).catch(() => undefined);
@@ -257,9 +261,33 @@ export async function startSession(options: StartSessionOptions): Promise<Record
   } finally {
     await log.close();
   }
-  const state = await waitForState(config.runtimeDirectory, config.startupTimeoutMs);
-  assertCompatibleSession(state, config);
-  return state;
+  try {
+    const state = await waitForState(config.runtimeDirectory, config.startupTimeoutMs);
+    assertCompatibleSession(state, config);
+    return state;
+  } catch (error) {
+    await reapFailedStartup(config.runtimeDirectory, configPath, supervisor);
+    throw error;
+  }
+}
+
+/**
+ * A startup that timed out must not leak a detached 60 FPS encoder: ask the
+ * supervisor to shut down (its signal handler runs full finalization), and
+ * unlink the config claim when the supervisor died before writing any state
+ * so the runtime directory stays usable for a retry.
+ */
+async function reapFailedStartup(
+  runtimeDirectory: string,
+  configPath: string,
+  supervisor: OwnedProcessIdentity | null,
+): Promise<void> {
+  if (supervisor !== null) await signalOwned(supervisor, "SIGTERM").catch(() => undefined);
+  const state = await readState(runtimeDirectory).catch(() => null);
+  const supervisorDead = supervisor === null || !(await identityIsAlive(supervisor));
+  if (state === null && supervisorDead) {
+    await unlink(configPath).catch(() => undefined);
+  }
 }
 
 /** Read durable state without requiring the original caller or process handles. */
@@ -293,6 +321,8 @@ export async function stopSession(options: StopSessionOptions): Promise<Recordin
       timeoutMs,
     );
     if (terminal !== null) return terminal;
+  } else if (first.supervisorAlive) {
+    await waitForIdentityExit(first.state.supervisor, remainingTimeout(deadline, 2_000, "stop"));
   }
   return recoverUnderLock(directory, deadline, timeoutMs);
 }
@@ -358,7 +388,7 @@ async function recoverUnderLock(
     if (current === null) throw error;
     recovered = await finishState(current, errorMessage(error), []);
   } finally {
-    await releaseDisplayLock(recoveryLockPath, recoveryOwner);
+    await releaseOwnedLock(recoveryLockPath, recoveryOwner);
   }
   return {
     exists: true,
@@ -432,7 +462,7 @@ async function supervise(configPath: string): Promise<void> {
   } finally {
     stop.dispose();
     if (!(await hasLiveOwnedProcess(state))) {
-      await releaseDisplayLock(state.displayLockPath, supervisor);
+      await releaseOwnedLock(state.displayLockPath, supervisor);
     }
   }
 }
@@ -471,7 +501,7 @@ async function writeInitialState(
   try {
     await writeState(state);
   } catch (error) {
-    await releaseDisplayLock(displayReservation.lockPath, supervisor);
+    await releaseOwnedLock(displayReservation.lockPath, supervisor);
     throw error;
   }
   return state;
@@ -906,7 +936,7 @@ async function recoverSession(
   if (await hasLiveOwnedProcess(state)) {
     failure ??= "Recording-owned processes remained alive after cleanup";
   } else {
-    await releaseDisplayLock(state.displayLockPath, state.supervisor);
+    await releaseOwnedLock(state.displayLockPath, state.supervisor);
   }
   if (failure === undefined) {
     const { failure: _failure, warnings: _warnings, ...cleanState } = state;
@@ -1199,7 +1229,9 @@ async function waitForStarted(
   while (Date.now() < deadline) {
     if (state.phase === "recording" || !isActive(state.phase)) return state;
     if (!(await identityIsAlive(state.supervisor))) {
-      return finishState(state, "Recording supervisor exited during startup", []);
+      const fresh = (await readState(state.runtimeDirectory)) ?? state;
+      if (fresh.phase === "recording" || !isActive(fresh.phase)) return fresh;
+      return finishState(fresh, "Recording supervisor exited during startup", []);
     }
     await delay(50);
     state = (await readState(state.runtimeDirectory)) ?? state;
@@ -1224,16 +1256,12 @@ async function waitForTerminalState(
     ) {
       return {
         exists: true,
-        supervisorAlive: await identityIsAlive(state.supervisor),
+        supervisorAlive: false,
         state,
         capture: await readCaptureProgress(sessionPaths(runtimeDirectory).ffmpegProgressPath),
       };
     }
-    if (
-      returnWhenSupervisorExits &&
-      state !== null &&
-      (await identityIsAlive(state.supervisor)) === false
-    ) {
+    if (returnWhenSupervisorExits && state !== null && !(await identityIsAlive(state.supervisor))) {
       return null;
     }
     await delay(100);
@@ -1477,21 +1505,17 @@ async function acquireDisplay(
     if (await tryCreateOwnedLock(lockPath, owner)) {
       return { display: `:${number}`, lockPath };
     }
-    const stale = await readDisplayOwner(lockPath);
+    const stale = await readLockOwner(lockPath);
     if (stale !== null && !(await identityIsAlive(stale))) {
-      const removed = await unlink(lockPath).then(
-        () => true,
-        () => false,
-      );
-      if (removed) offset -= 1;
+      if (await removeStaleLock(lockPath, stale)) offset -= 1;
     }
   }
   throw new Error("No recording-owned X display is available");
 }
 
-async function readDisplayOwner(path: string): Promise<OwnedProcessIdentity | null> {
+async function readLockOwner(path: string): Promise<OwnedProcessIdentity | null> {
   try {
-    const parsed = parseObject(await readBoundedText(path), "display lock");
+    const parsed = parseObject(await readBoundedText(path), "lock");
     return isIdentity(parsed) ? parsed : null;
   } catch {
     return null;
@@ -1501,13 +1525,33 @@ async function readDisplayOwner(path: string): Promise<OwnedProcessIdentity | nu
 async function acquireRecoveryLock(path: string, owner: OwnedProcessIdentity): Promise<boolean> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     if (await tryCreateOwnedLock(path, owner)) return true;
-    const current = await readDisplayOwner(path);
+    const current = await readLockOwner(path);
     if (current !== null && (await identityIsAlive(current))) return false;
-    await unlink(path).catch((unlinkError: unknown) => {
-      if (!hasCode(unlinkError, "ENOENT")) throw unlinkError;
-    });
+    await removeStaleLock(path, current);
   }
   return false;
+}
+
+/**
+ * Remove a lock believed stale without racing a contender that already
+ * replaced it: claim the file atomically via rename, verify what was caught,
+ * and restore it when it turned out to be a live owner's fresh lock.
+ */
+async function removeStaleLock(path: string, stale: OwnedProcessIdentity | null): Promise<boolean> {
+  const graveyard = `${path}.${randomUUID()}.stale`;
+  try {
+    await rename(path, graveyard);
+  } catch {
+    return false;
+  }
+  const caught = await readLockOwner(graveyard);
+  const caughtFreshLock =
+    caught !== null &&
+    (stale === null || !sameIdentity(caught, stale)) &&
+    (await identityIsAlive(caught));
+  if (caughtFreshLock) await link(graveyard, path).catch(() => undefined);
+  await unlink(graveyard).catch(() => undefined);
+  return !caughtFreshLock;
 }
 
 async function tryCreateOwnedLock(path: string, owner: OwnedProcessIdentity): Promise<boolean> {
@@ -1530,8 +1574,8 @@ async function tryCreateOwnedLock(path: string, owner: OwnedProcessIdentity): Pr
   }
 }
 
-async function releaseDisplayLock(path: string, owner: OwnedProcessIdentity): Promise<void> {
-  const current = await readDisplayOwner(path);
+async function releaseOwnedLock(path: string, owner: OwnedProcessIdentity): Promise<void> {
+  const current = await readLockOwner(path);
   if (current !== null && sameIdentity(current, owner)) await unlink(path).catch(() => undefined);
 }
 
@@ -1620,7 +1664,7 @@ async function hasLiveOwnedProcess(state: RecordingSessionState): Promise<boolea
 }
 
 async function hasOwnedDisplayLock(state: RecordingSessionState): Promise<boolean> {
-  const owner = await readDisplayOwner(state.displayLockPath);
+  const owner = await readLockOwner(state.displayLockPath);
   return owner !== null && sameIdentity(owner, state.supervisor);
 }
 
@@ -1751,7 +1795,7 @@ async function waitForFfmpeg(
       throw new Error("FFmpeg exited before capture readiness");
     }
     try {
-      const progress = await readBoundedText(progressPath);
+      const progress = await readProgressTail(progressPath);
       if (/^frame=[1-9]\d*$/mu.test(progress)) return;
     } catch (error) {
       if (!hasCode(error, "ENOENT")) throw error;
@@ -1761,10 +1805,30 @@ async function waitForFfmpeg(
   throw new Error("FFmpeg capture readiness timed out");
 }
 
+const PROGRESS_TAIL_BYTES = 16_384;
+
+/**
+ * Read the tail of FFmpeg's append-only progress log. The file grows without
+ * bound during capture (~700 B/s), and the last complete block always carries
+ * the current values, so the tail is sufficient and O(1) regardless of length.
+ */
+async function readProgressTail(path: string): Promise<string> {
+  const handle = await open(path, "r");
+  try {
+    const { size } = await handle.stat();
+    const length = Math.min(size, PROGRESS_TAIL_BYTES);
+    if (length === 0) return "";
+    const { buffer, bytesRead } = await handle.read(Buffer.alloc(length), 0, length, size - length);
+    return buffer.toString("utf8", 0, bytesRead);
+  } finally {
+    await handle.close();
+  }
+}
+
 async function readCaptureProgress(progressPath: string): Promise<RecordingCaptureProgress> {
   let source: string;
   try {
-    source = await readBoundedText(progressPath);
+    source = await readProgressTail(progressPath);
   } catch (error) {
     if (hasCode(error, "ENOENT")) return { frame: 0, outputTimeMs: 0 };
     throw error;
@@ -1958,7 +2022,10 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-if (process.argv[2] === SUPERVISOR_MODE) {
+const isEntryModule =
+  process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isEntryModule && process.argv[2] === SUPERVISOR_MODE) {
   const configPath = process.argv[3];
   if (configPath === undefined) {
     process.stderr.write("Missing recording supervisor config path\n");
