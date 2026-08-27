@@ -100,6 +100,10 @@ async function supervise(configPath: string): Promise<void> {
     await raceStopAgainstExits(stop.requested, processes);
   } catch (error) {
     failure = errorMessage(error);
+    // startRecordingStack persisted owned PIDs and browser progress before it
+    // threw; reload them so finalization does not overwrite disk with the
+    // stale pre-startup snapshot.
+    state = (await readState(config.runtimeDirectory).catch(() => null)) ?? state;
   }
 
   try {

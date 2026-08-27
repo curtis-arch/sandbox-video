@@ -121,11 +121,12 @@ async function reapFailedStartup(
   supervisor: OwnedProcessIdentity | null,
 ): Promise<void> {
   if (supervisor !== null) await signalOwned(supervisor, "SIGTERM").catch(() => undefined);
-  const state = await readState(runtimeDirectory).catch(() => null);
   const supervisorDead = supervisor === null || !(await identityIsAlive(supervisor));
-  if (state === null && supervisorDead) {
-    await unlink(configPath).catch(() => undefined);
-  }
+  if (!supervisorDead) return;
+  // Confirmed dead before reading: a dead supervisor cannot write state after
+  // this point, so a missing state file proves the config claim is abandoned.
+  const state = await readState(runtimeDirectory).catch(() => null);
+  if (state === null) await unlink(configPath).catch(() => undefined);
 }
 
 /** Read durable state without requiring the original caller or process handles. */
