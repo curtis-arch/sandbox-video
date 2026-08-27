@@ -10,6 +10,7 @@ import {
   processIdentity,
   releaseOwnedLock,
   signalOwned,
+  stopOwned,
   waitForIdentityExit,
   waitForSpawn,
   type OwnedProcessIdentity,
@@ -107,7 +108,7 @@ export async function startSession(options: StartSessionOptions): Promise<Record
   } catch (error) {
     const late = await lateStartedState(config);
     if (late !== null) return late;
-    await reapFailedStartup(config.runtimeDirectory, configPath, supervisor);
+    await reapFailedStartup(config, configPath, supervisor);
     throw error;
   }
 }
@@ -177,17 +178,24 @@ async function releaseAbandonedClaim(runtimeDirectory: string, configPath: strin
  * so the runtime directory stays usable for a retry.
  */
 async function reapFailedStartup(
-  runtimeDirectory: string,
+  config: NormalizedSessionConfig,
   configPath: string,
   supervisor: OwnedProcessIdentity | null,
 ): Promise<void> {
-  if (supervisor !== null) await signalOwned(supervisor, "SIGTERM").catch(() => undefined);
-  const supervisorDead = supervisor === null || !(await identityIsAlive(supervisor));
-  if (!supervisorDead) return;
+  if (supervisor !== null) {
+    await stopOwned(supervisor, "SIGTERM", config.stopTimeoutMs);
+  }
   // Confirmed dead before reading: a dead supervisor cannot write state after
   // this point, so a missing state file proves the config claim is abandoned.
-  const state = await readState(runtimeDirectory).catch(() => null);
-  if (state === null) await unlink(configPath).catch(() => undefined);
+  const state = await readState(config.runtimeDirectory).catch(() => null);
+  if (state === null) {
+    await unlink(configPath).catch(() => undefined);
+    return;
+  }
+  await stopSession({
+    runtimeDirectory: config.runtimeDirectory,
+    timeoutMs: config.stopTimeoutMs,
+  });
 }
 
 /** Read durable state without requiring the original caller or process handles. */
@@ -224,7 +232,7 @@ export async function stopSession(options: StopSessionOptions): Promise<Recordin
   } else if (first.supervisorAlive) {
     await waitForIdentityExit(first.state.supervisor, remainingTimeout(deadline, 2_000, "stop"));
   }
-  return recoverUnderLock(directory, deadline, timeoutMs);
+  return recoverUnderLock(directory, deadline);
 }
 
 async function terminateSupervisor(
@@ -253,18 +261,16 @@ async function terminateSupervisor(
 async function recoverUnderLock(
   directory: string,
   deadline: number,
-  timeoutMs: number,
 ): Promise<RecordingSessionStatus> {
   const recoveryOwner = await currentIdentity();
   const recoveryLockPath = join(directory, RECOVERY_LOCK_NAME);
-  if (!(await acquireRecoveryLock(recoveryLockPath, recoveryOwner))) {
+  while (!(await acquireRecoveryLock(recoveryLockPath, recoveryOwner))) {
     const terminal = await waitForTerminalState(
       directory,
-      remainingTimeout(deadline, timeoutMs, "concurrent stop"),
+      remainingTimeout(deadline, 250, "concurrent stop"),
       false,
     );
     if (terminal !== null) return terminal;
-    throw new Error("Another stop process did not finish before the timeout");
   }
   let recovered: RecordingSessionState;
   try {

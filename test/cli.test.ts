@@ -77,6 +77,13 @@ test("invalid input fails without stdout and explains recovery as JSON", () => {
   assert.equal(object(parseJson(trailing.stderr)).ok, false);
 });
 
+test("recording IDs remain case-insensitive", () => {
+  const result = runCli("status", "--recording-id", "00000000-0000-4000-8000-00000000000A");
+  assert.equal(result.status, 20);
+  assert.equal(result.stdout, "");
+  assert.equal(object(object(parseJson(result.stderr)).error).code, "RECORDING_NOT_FOUND");
+});
+
 function runCli(...arguments_: readonly string[]): {
   readonly status: number | null;
   readonly stdout: string;

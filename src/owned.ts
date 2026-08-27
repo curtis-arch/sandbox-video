@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { link, open, readFile, unlink, writeFile } from "node:fs/promises";
+import { link, open, readFile, stat, unlink, writeFile } from "node:fs/promises";
 
 import {
   delay,
@@ -161,6 +161,53 @@ function parseLockOwner(source: string): OwnedProcessIdentity | null {
   }
 }
 
+interface LockFileIdentity {
+  readonly device: bigint;
+  readonly inode: bigint;
+  readonly size: bigint;
+  readonly modifiedAtNs: bigint;
+  readonly changedAtNs: bigint;
+}
+
+async function lockFileIdentity(path: string): Promise<LockFileIdentity | null> {
+  try {
+    const details = await stat(path, { bigint: true });
+    return {
+      device: details.dev,
+      inode: details.ino,
+      size: details.size,
+      modifiedAtNs: details.mtimeNs,
+      changedAtNs: details.ctimeNs,
+    };
+  } catch (error) {
+    if (hasCode(error, "ENOENT")) return null;
+    throw error;
+  }
+}
+
+function sameLockFile(left: LockFileIdentity, right: LockFileIdentity): boolean {
+  return (
+    left.device === right.device &&
+    left.inode === right.inode &&
+    left.size === right.size &&
+    left.modifiedAtNs === right.modifiedAtNs &&
+    left.changedAtNs === right.changedAtNs
+  );
+}
+
+async function unlinkUnchangedLock(path: string, observed: LockFileIdentity): Promise<boolean> {
+  const current = await lockFileIdentity(path);
+  if (current === null) return true;
+  if (!sameLockFile(current, observed)) return false;
+  try {
+    await unlink(path);
+    return true;
+  } catch (error) {
+    if (hasCode(error, "ENOENT")) return true;
+    throw error;
+  }
+}
+
 /**
  * Remove a lock believed stale without ever deleting a live owner's lock:
  * removal is serialized through a short-lived breaker lock, and only the
@@ -178,18 +225,22 @@ export async function removeStaleLock(
     // Unlink a contender's breaker only when its holder was actually read and
     // is dead; a null read (vanished or unreadable) must not remove a breaker
     // that a live contender may have just created.
-    let holder: OwnedProcessIdentity | null = null;
+    const observed = await lockFileIdentity(breakerPath);
+    if (observed === null) return false;
+    let holder: OwnedProcessIdentity | null;
     try {
       holder = parseLockOwner(await readBoundedText(breakerPath));
     } catch {
       return false;
     }
     if (holder !== null && !(await identityIsAlive(holder))) {
-      await unlink(breakerPath).catch(() => undefined);
+      await unlinkUnchangedLock(breakerPath, observed);
     }
     return false;
   }
   try {
+    const observed = await lockFileIdentity(path);
+    if (observed === null) return true;
     let current: OwnedProcessIdentity | null = null;
     try {
       current = parseLockOwner(await readBoundedText(path));
@@ -199,18 +250,19 @@ export async function removeStaleLock(
       // live; treat it as corrupt and removable, as the caller already did.
     }
     if (current !== null && (await identityIsAlive(current))) return false;
-    await unlink(path).catch((error: unknown) => {
-      if (!hasCode(error, "ENOENT")) throw error;
-    });
-    return true;
+    return unlinkUnchangedLock(path, observed);
   } finally {
-    await unlink(breakerPath).catch(() => undefined);
+    await releaseOwnedLock(breakerPath, breaker);
   }
 }
 
 export async function releaseOwnedLock(path: string, owner: OwnedProcessIdentity): Promise<void> {
+  const observed = await lockFileIdentity(path);
+  if (observed === null) return;
   const current = await readLockOwner(path);
-  if (current !== null && sameIdentity(current, owner)) await unlink(path).catch(() => undefined);
+  if (current !== null && sameIdentity(current, owner)) {
+    await unlinkUnchangedLock(path, observed);
+  }
 }
 
 export async function acquireRecoveryLock(

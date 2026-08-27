@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  getSessionStatus,
   startSession,
   stopSession,
   type OwnedProcessIdentity,
@@ -13,6 +14,7 @@ import {
   type RecordingSessionPhase,
   type RecordingSessionState,
 } from "../src/session.js";
+import { identityIsAlive } from "../src/owned.js";
 import type { UploadsPublication } from "../src/uploads.js";
 
 const linuxOnly = { skip: process.platform !== "linux" } as const;
@@ -82,6 +84,69 @@ test("browser opens the configured URL before FFmpeg capture starts", linuxOnly,
       `browser:${initialUrl}`,
       "ffmpeg",
     ]);
+  } finally {
+    await stopSession({ runtimeDirectory, timeoutMs: 5_000 }).catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("startup timeout returns only after detached processes are reaped", linuxOnly, async () => {
+  const root = await mkdtemp(join(tmpdir(), "sandbox-video-start-timeout-"));
+  const executableDirectory = join(root, "bin");
+  const runtimeDirectory = join(root, "runtime");
+  await mkdir(executableDirectory, { recursive: true });
+
+  const xvfb = join(executableDirectory, "Xvfb");
+  const xauth = join(executableDirectory, "xauth");
+  const mcookie = join(executableDirectory, "mcookie");
+  const xdpyinfo = join(executableDirectory, "xdpyinfo");
+  await Promise.all([
+    writeExecutable(
+      xvfb,
+      '#!/usr/bin/env node\nprocess.on("SIGTERM",()=>setTimeout(()=>process.exit(0),400));setInterval(()=>{},1000);\n',
+    ),
+    writeExecutable(
+      xauth,
+      '#!/usr/bin/env node\nrequire("node:fs").writeFileSync(process.argv[3],"");\n',
+    ),
+    writeExecutable(mcookie, "#!/bin/sh\nprintf 'abc123\\n'\n"),
+    writeExecutable(xdpyinfo, "#!/bin/sh\nexit 1\n"),
+  ]);
+
+  try {
+    await assert.rejects(
+      startSession({
+        recordingId: "00000000-0000-4000-8000-000000000008",
+        runtimeDirectory,
+        width: 1280,
+        height: 720,
+        fps: 30,
+        displayNumber: 65_008,
+        startupTimeoutMs: 200,
+        stopTimeoutMs: 2_000,
+        executables: {
+          agentBrowser: "/usr/bin/true",
+          ffmpeg: "/usr/bin/true",
+          ffprobe: "/usr/bin/true",
+          mcookie,
+          openbox: "/usr/bin/true",
+          xauth,
+          xdpyinfo,
+          xprop: "/usr/bin/true",
+          xvfb,
+        },
+      }),
+      /Recording startup did not finish/u,
+    );
+
+    const status = await getSessionStatus(runtimeDirectory);
+    assert.equal(status.exists, true);
+    if (!status.exists) return;
+    assert.equal(status.supervisorAlive, false);
+    assert.equal(
+      status.state.xvfb === undefined || !(await identityIsAlive(status.state.xvfb)),
+      true,
+    );
   } finally {
     await stopSession({ runtimeDirectory, timeoutMs: 5_000 }).catch(() => undefined);
     await rm(root, { recursive: true, force: true });
@@ -307,6 +372,43 @@ test(
     }
   },
 );
+
+test("stop retries recovery after the lock holder exits", linuxOnly, async () => {
+  const fixture = await createFixture({
+    recordingId: "00000000-0000-4000-8000-000000000009",
+    phase: "uploading_mp4",
+    publication: publicationFor("00000000-0000-4000-8000-000000000009"),
+  });
+  const holder = spawn(process.execPath, ["-e", "setTimeout(()=>process.exit(0),750)"], {
+    stdio: "ignore",
+  });
+  await new Promise<void>((resolve, reject) => {
+    holder.once("spawn", resolve);
+    holder.once("error", reject);
+  });
+  assert.ok(holder.pid !== undefined);
+  const owner: OwnedProcessIdentity = {
+    pid: holder.pid,
+    startTimeTicks: await readStartTimeTicks(holder.pid),
+    executable: process.execPath,
+  };
+  await writeFile(join(fixture.runtimeDirectory, "recovery.lock"), `${JSON.stringify(owner)}\n`);
+
+  try {
+    const result = await stopSession({
+      runtimeDirectory: fixture.runtimeDirectory,
+      timeoutMs: 3_000,
+    });
+
+    assert.equal(result.exists, true);
+    if (!result.exists) return;
+    assert.equal(result.state.phase, "finished");
+    assert.deepEqual(result.state.publication, fixture.publication);
+  } finally {
+    holder.kill("SIGKILL");
+    await fixture.cleanup();
+  }
+});
 
 interface FixtureOptions {
   readonly recordingId: string;

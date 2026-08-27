@@ -37,6 +37,11 @@ sandbox-video start \
   --size 1920x1080
 ```
 
+Startup waits up to 30 seconds for the browser and FFmpeg capture to become
+ready. Use `--startup-timeout-ms` to adjust that window for a slower Sandbox.
+If startup times out, the CLI stops the detached supervisor and its owned
+processes before returning the failure.
+
 The CLI opens `--url` before FFmpeg starts. This keeps browser startup and the
 black X11 root window out of the recording. If `--url` is omitted, the browser
 opens `about:blank`.
