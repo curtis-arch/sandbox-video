@@ -11,6 +11,7 @@ import {
   type RecordingSessionPhase,
   type RecordingSessionStatus,
 } from "./session.js";
+import { defined, delay } from "./util.js";
 
 const CLI_VERSION = "0.1.2";
 const SCHEMA_VERSION = 1 as const;
@@ -168,10 +169,10 @@ async function startCommand(argv: readonly string[]): Promise<number> {
     width,
     height,
     fps: fpsValue,
-    ...(initialUrl === undefined ? {} : { initialUrl }),
+    ...defined({ initialUrl }),
     upload: {
       key: `screenshots/sandbox-video/${recordingId}/proof.mp4`,
-      ...(workspace === undefined ? {} : { workspace }),
+      ...defined({ workspace }),
     },
   }).catch((error: unknown) => {
     throw new CommandError(
@@ -300,10 +301,10 @@ function statusPayload(status: Extract<RecordingSessionStatus, { readonly exists
     capture: status.capture,
     startedAt: state.startedAt,
     updatedAt: state.updatedAt,
-    ...(state.finishedAt === undefined ? {} : { finishedAt: state.finishedAt }),
+    ...defined({ finishedAt: state.finishedAt }),
     ...(state.publication === undefined ? {} : state.publication),
-    ...(state.failure === undefined ? {} : { error: state.failure }),
-    ...(state.warnings === undefined ? {} : { warnings: state.warnings }),
+    ...defined({ error: state.failure }),
+    ...defined({ warnings: state.warnings }),
   };
 }
 
@@ -485,10 +486,6 @@ function safeMessage(error: unknown): string {
   return secrets
     .reduce((safe, secret) => safe.replaceAll(secret, "[redacted]"), message)
     .slice(0, 2_000);
-}
-
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
 }
 
 class CliError extends Error {

@@ -1,6 +1,7 @@
 import { stat } from "node:fs/promises";
 
 import { runExact, type ExactCommandResult } from "./process.js";
+import { defined, delay, isRecord } from "./util.js";
 
 const OUTPUT_LIMIT_BYTES = 1_000_000;
 const DEFAULT_TIMEOUT_MS = 5 * 60_000;
@@ -53,7 +54,7 @@ export async function uploadFinalMp4(options: UploadFinalMp4Options): Promise<Up
       environment,
       timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       outputLimitBytes: OUTPUT_LIMIT_BYTES,
-      ...(options.signal === undefined ? {} : { signal: options.signal }),
+      ...defined({ signal: options.signal }),
     },
   );
   if (result.exitCode !== 0) throw uploadFailure(result, environment);
@@ -149,17 +150,13 @@ function uploadsEnvironment(source: NodeJS.ProcessEnv, workspace?: string): Node
   const token = source.UPLOADS_TOKEN;
   return {
     PATH: source.PATH ?? "/usr/local/bin:/usr/bin:/bin",
-    ...(source.HOME === undefined ? {} : { HOME: source.HOME }),
-    ...(source.XDG_CONFIG_HOME === undefined ? {} : { XDG_CONFIG_HOME: source.XDG_CONFIG_HOME }),
-    ...(source.BUILDINTERNET_CONFIG === undefined
-      ? {}
-      : { BUILDINTERNET_CONFIG: source.BUILDINTERNET_CONFIG }),
+    ...defined({ HOME: source.HOME }),
+    ...defined({ XDG_CONFIG_HOME: source.XDG_CONFIG_HOME }),
+    ...defined({ BUILDINTERNET_CONFIG: source.BUILDINTERNET_CONFIG }),
     ...(token === undefined || token.length === 0 ? {} : { UPLOADS_TOKEN: token }),
-    ...(workspace === undefined ? {} : { UPLOADS_WORKSPACE: workspace }),
-    ...(source.UPLOADS_API_URL === undefined ? {} : { UPLOADS_API_URL: source.UPLOADS_API_URL }),
-    ...(source.UPLOADS_SESSION_TOKEN === undefined
-      ? {}
-      : { UPLOADS_SESSION_TOKEN: source.UPLOADS_SESSION_TOKEN }),
+    ...defined({ UPLOADS_WORKSPACE: workspace }),
+    ...defined({ UPLOADS_API_URL: source.UPLOADS_API_URL }),
+    ...defined({ UPLOADS_SESSION_TOKEN: source.UPLOADS_SESSION_TOKEN }),
   };
 }
 
@@ -174,10 +171,6 @@ function parsePublicUrl(source: string): string {
     throw new Error("uploads put returned a non-public URL");
   }
   return url.toString();
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
 }
 
 async function verifyHostedPublication(
@@ -207,7 +200,7 @@ async function verifyHostedPublication(
     } catch (error) {
       detail = error instanceof Error ? error.message : String(error);
     }
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    await delay(250);
   }
   throw new Error(`Uploaded MP4 verification failed: ${detail}`);
 }

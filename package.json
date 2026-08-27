@@ -22,10 +22,7 @@
     "sandbox-video": "dist/src/cli.js"
   },
   "files": [
-    "dist/src/cli.*",
-    "dist/src/process.*",
-    "dist/src/session.*",
-    "dist/src/uploads.*",
+    "dist/src",
     "README.md",
     "SKILL.md"
   ],
