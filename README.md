@@ -1,15 +1,15 @@
 # sandbox-video
 
-`sandbox-video` records the headed browser used by an AI coding agent inside a
-Vercel Sandbox. It captures the shared X11 display with FFmpeg at 30 or 60 FPS,
-then publishes one browser-compatible MP4 through
+`sandbox-video` records the headed browser while an AI coding agent works inside
+a Vercel Sandbox. It aims for 60 FPS when the machine has room, backs off when
+the agent needs the CPU, and publishes one browser-compatible MP4 through
 [`uploads.sh`](https://uploads.sh).
 
-The CLI complements
-[`agent-browser`](https://github.com/vercel-labs/agent-browser); it does not
-fork it or replace its automation protocol. agent-browser's built-in video
-recorder samples one JPEG every 100 ms. This project captures the rendered
-display directly, so smooth motion and short visual defects remain observable.
+The CLI works alongside
+[`agent-browser`](https://github.com/vercel-labs/agent-browser). It leaves the
+automation protocol alone. agent-browser's built-in recorder samples one JPEG
+every 100 ms; `sandbox-video` records the rendered display directly, which
+keeps motion smooth enough to catch brief visual bugs.
 
 > Published on npm as [`sandbox-video`](https://www.npmjs.com/package/sandbox-video).
 
@@ -33,7 +33,6 @@ Start recording on the page you want to validate:
 ```sh
 sandbox-video start \
   --url http://127.0.0.1:3000 \
-  --fps 60 \
   --size 1920x1080
 ```
 
@@ -42,14 +41,42 @@ ready. Use `--startup-timeout-ms` to adjust that window for a slower Sandbox.
 If startup times out, the CLI stops the detached supervisor and its owned
 processes before returning the failure.
 
+You normally do not need to set `--fps`. Its default, `auto`, targets 60 FPS,
+uses `ultrafast` on a 1-vCPU Sandbox, and uses `veryfast` on larger machines.
+FFmpeg runs at Linux priority 10, so the agent gets CPU time first when both are
+busy. Pass `--fps 30` or `--fps 60` only when you want a fixed ceiling.
+
+The measured rate can fall below the target on a busy machine. That is useful
+data, not a failed recording. `start`, `status`, and `stop` report the chosen
+`capturePolicy`. After finalization, `stop` also reports `measuredFps`,
+`frames`, and `durationSeconds`.
+
+### Measured Vercel Sandbox performance
+
+These runs used 1920×1080, CRF 12, H.264/yuv420p, and a 60 FPS target. The table
+reports medians from successful runs. Treat them as a guide; different builds
+and Sandbox hosts will move the numbers around.
+
+| Vercel Sandbox | Auto preset | Median measured FPS                                            |
+| -------------- | ----------- | -------------------------------------------------------------- |
+| 1 vCPU / 2 GB  | `ultrafast` | 60 idle; 16.3 during four repeated TypeScript builds           |
+| 2 vCPU / 4 GB  | `veryfast`  | 60 idle; 53.2 during four repeated TypeScript builds           |
+| 4 vCPU / 8 GB  | `veryfast`  | 60 idle and with 256 MB plus 70% of one CPU in background load |
+| 8 vCPU / 16 GB | `veryfast`  | 60 idle and with 256 MB plus 70% of one CPU in background load |
+
+A 1-vCPU box is tight, but it still records. Four builds took a 6.4-second
+median with no recorder and 9.25 seconds with auto enabled. The old
+normal-priority `veryfast` setup took 21.2 seconds. On 2 vCPU, auto reduced the
+recorded build median from 9.40 to 6.89 seconds and kept 53.2 FPS.
+
 The CLI opens `--url` before FFmpeg starts. This keeps browser startup and the
 black X11 root window out of the recording. If `--url` is omitted, the browser
 opens `about:blank`.
 
-`sandbox-video --help` is the runtime contract for an agent. It writes a JSON
-manifest containing commands, typed parameters, effects, exit codes, the exact
-workflow, prerequisites, and the update policy. `sandbox-video start --help`,
-`status --help`, and `stop --help` return the contract for one command.
+`sandbox-video --help` gives an agent the complete JSON command contract:
+parameters, return fields, exit codes, prerequisites, and the required order of
+operations. `sandbox-video start --help`, `status --help`, and `stop --help`
+return the contract for one command.
 
 Every successful command writes one stable envelope to stdout and leaves
 stderr empty, except that `stop` emits progress events on stderr. A failed
@@ -62,6 +89,14 @@ command leaves stdout empty and writes one JSON error envelope to stderr:
   "data": {
     "status": "recording",
     "recordingId": "865a5385-54c0-4efa-8b61-5013e6391737",
+    "fps": 60,
+    "capturePolicy": {
+      "mode": "auto",
+      "targetFps": 60,
+      "encoderPreset": "veryfast",
+      "processPriority": 10,
+      "availableVcpus": 2
+    },
     "agentBrowserCommand": [
       "agent-browser",
       "--namespace",
@@ -71,7 +106,7 @@ command leaves stdout empty and writes one JSON error envelope to stderr:
     ]
   },
   "meta": {
-    "cliVersion": "0.1.3",
+    "cliVersion": "0.2.0",
     "command": "start",
     "effect": "recording-started"
   }
@@ -115,8 +150,9 @@ agent knows work is continuing:
 ```
 
 Its one stdout JSON object contains the terminal status, hosted URL, storage
-key, content type, and byte size. Repeating `stop` returns the same terminal
-result without recording or uploading again.
+key, content type, byte size, measured frame rate, frame count, and duration.
+Repeating `stop` returns the same terminal result without recording, probing,
+or uploading again.
 
 ## Runtime ownership
 
@@ -139,16 +175,18 @@ owned process.
 
 The supervisor stores local HLS segments while recording. On explicit stop it
 closes Chrome, drains FFmpeg, stream-copy remuxes the playlist with `+faststart`
-to a temporary MP4, verifies its codec, pixel format, geometry, frame rate,
-frame count, duration, and full decode, then atomically installs and uploads the
-final MP4. It verifies the hosted content type and byte length before returning
-the URL and removes the owned processes. HLS is an internal crash recovery
-format, not a public artifact.
+to a temporary MP4, verifies its codec, pixel format, geometry, positive
+measured frame rate, frame count, duration, and full decode, then atomically
+installs and uploads the final MP4. The measured frame rate does not have to
+equal the requested rate. The CLI verifies the hosted content type and byte
+length before returning the URL and removes the owned processes. HLS is an
+internal crash recovery format, not a public artifact.
 
 ## Requirements inside the Sandbox
 
 - Node.js 24 or later
 - FFmpeg with `x11grab` and `libx264`, plus ffprobe
+- `nice` from GNU coreutils
 - Xvfb, openbox, xauth, mcookie, xdpyinfo, and xprop
 - agent-browser and its Chromium installation
 - uploads.sh CLI 0.48.0 or later, authenticated with `uploads login`
@@ -170,10 +208,10 @@ npm install --global .
 Install the published CLI inside a prepared Sandbox image:
 
 ```sh
-npm install --global sandbox-video@0.1.3
+npm install --global sandbox-video@0.2.0
 ```
 
-An agent can instead use `npx --yes sandbox-video@0.1.3 <command>`. Pin the
+An agent can instead use `npx --yes sandbox-video@0.2.0 <command>`. Pin the
 same exact version for `start`, `status`, and `stop`. There is intentionally no
 self-update command or automatic update check: npm/npx owns installation, and
 the response schema must not change in the middle of a recording lifecycle.
@@ -184,12 +222,13 @@ remain the responsibility of the coding environment.
 
 ## Encoding profile
 
-The current v2 product creates one pull-request-ready output. Capture performs
-the only encode; finalization remuxes without re-encoding:
+v2 writes one MP4 that can go straight into a pull request. Capture performs
+the only encode. Finalization remuxes the HLS segments without re-encoding:
 
 ```sh
-ffmpeg -f x11grab -framerate FPS -video_size WIDTHxHEIGHT -i DISPLAY.0 \
-  -an -c:v libx264 -preset veryfast -crf 12 -pix_fmt yuv420p \
+nice -n 10 ffmpeg \
+  -f x11grab -framerate FPS -video_size WIDTHxHEIGHT -i DISPLAY.0 \
+  -an -c:v libx264 -preset PRESET -crf 12 -pix_fmt yuv420p \
   -fps_mode passthrough -g $((FPS * 2)) -keyint_min $((FPS * 2)) \
   -sc_threshold 0 \
   -force_key_frames 'expr:gte(t,n_forced*SEGMENT_SECONDS)' \
@@ -200,22 +239,33 @@ ffmpeg -f x11grab -framerate FPS -video_size WIDTHxHEIGHT -i DISPLAY.0 \
 ffmpeg -i index.m3u8 -c copy -movflags +faststart recording.mp4
 ```
 
+`PRESET` is `ultrafast` on 1 vCPU and `veryfast` on larger Sandboxes. FFmpeg
+runs at Linux process priority 10. It can use the whole machine while the agent
+is idle, then yield when a build or test starts.
+
 The [encoding quality study](./benchmarks/encoding-quality/README.md) also
 tested CRF 23/4:2:0, CRF 23/4:4:4, CRF 16/4:4:4, CRF 14/4:4:4, CRF 12/4:4:4,
-and a high-quality RGB reference. It established that 4:4:4 preserves colored
-UI edges better, but hosted Chrome did not play those files reliably. The v1
+and a high-quality RGB reference. The results showed that 4:4:4 preserves
+colored UI edges better, but hosted Chrome did not play those files reliably. The v1
 pipeline therefore produced separate 4:4:4 evidence and 4:2:0 share files.
 
-v2 deliberately selects one CRF 12/4:2:0 artifact. That removes a second encode,
-cuts finalization time, and gives an agent one URL that plays in browsers and
-GitHub PRs. The benchmark remains in the repository so this tradeoff is not
-mistaken for an untested default.
+v2 uses one CRF 12/4:2:0 artifact. There is no second encode, finalization is
+shorter, and the agent gets one URL that plays in browsers and GitHub PRs. The
+benchmark stays in the repository with the data behind that choice.
 
 ## Real Sandbox verification
 
 The interactive React fixture lives in
 [`benchmarks/recording-test-rig`](./benchmarks/recording-test-rig). It is a
 benchmark, not shipped npm code.
+
+On September 1, 2026, the auto policy passed all 18 package tests on fresh
+1-vCPU and 2-vCPU Vercel Sandboxes. End-to-end capture confirmed Linux priority
+10 from `/proc`. The 1-vCPU machine produced 60 FPS while idle and 16.35 FPS
+while running four builds, which completed in 9.52 seconds. The 2-vCPU machine
+produced 52.32 FPS during the same workload, which completed in 6.89 seconds.
+Every recording decoded successfully. These private verification runs did not
+upload their MP4s.
 
 On August 26, 2026, the release candidate passed all 14 package tests inside a
 4-vCPU Vercel Sandbox. The Linux-only cases cover concurrent stop calls,
@@ -243,7 +293,7 @@ remained, and the Sandbox was explicitly stopped.
 
 ## Failure and durability boundary
 
-Exit codes are intentionally small:
+The CLI uses four exit codes:
 
 | Exit | Meaning                                                   |
 | ---: | --------------------------------------------------------- |
@@ -258,15 +308,14 @@ still exists, but they do not survive abrupt Sandbox destruction. The caller
 must reserve enough Sandbox lifetime to run `stop` and wait for its terminal
 JSON result.
 
-Progressive remote chunk persistence is intentionally deferred until the
-project owns a storage service that can accept chunks and assemble them
-atomically. v2 does not claim protection it does not provide.
+The CLI does not upload chunks while recording. That would require storage that
+can accept partial video and assemble it safely. For now, an abruptly destroyed
+Sandbox can still take its local HLS segments with it.
 
-The uploads.sh token is available to processes running as the same Sandbox user,
-whether supplied through the environment or the shared config file. Do not run
-untrusted code in the recording Sandbox. Strong credential isolation requires
-an uploader outside that trust boundary and is not part of this simplified
-single-Sandbox design.
+Every process running as the same Sandbox user can reach the uploads.sh token,
+whether it came from the environment or the shared config file. Do not run
+untrusted code in the recording Sandbox. Isolating that credential would
+require a separate uploader.
 
 ## Development
 

@@ -13,12 +13,12 @@ import {
 } from "./session.js";
 import { defined, delay } from "./util.js";
 
-const CLI_VERSION = "0.1.3";
+const CLI_VERSION = "0.2.0";
 const SCHEMA_VERSION = 1 as const;
 const RUNTIME_ROOT = "/tmp/sandbox-video";
 const DEFAULT_WIDTH = 1920;
 const DEFAULT_HEIGHT = 1080;
-const DEFAULT_FPS = 60;
+const DEFAULT_FPS = "auto" as const;
 const DEFAULT_STOP_TIMEOUT_MS = 10 * 60_000;
 const POLL_INTERVAL_MS = 250;
 const EXIT_USAGE = 2;
@@ -31,7 +31,15 @@ const COMMANDS = [
     description: "Start one headed agent-browser recording in the current Sandbox.",
     effect: "mutating",
     parameters: [
-      { name: "--fps", type: "integer", required: false, default: 60, enum: [30, 60] },
+      {
+        name: "--fps",
+        type: "string-or-integer",
+        required: false,
+        default: "auto",
+        enum: ["auto", 30, 60],
+        description:
+          "Auto protects agent work and targets 60 FPS; 30 or 60 sets an explicit ceiling.",
+      },
       {
         name: "--size",
         type: "string",
@@ -64,8 +72,9 @@ const COMMANDS = [
       "Retain data.recordingId and every token in data.agentBrowserCommand.",
       "Append each browser action to that exact agentBrowserCommand; do not create another session.",
       "Confirm frame growth with status, then call stop and wait for its URL before ending the Sandbox.",
+      "Leave --fps at auto unless the user requests a fixed ceiling.",
     ],
-    returns: ["recordingId", "agentBrowserCommand", "display", "fps", "size"],
+    returns: ["recordingId", "agentBrowserCommand", "display", "fps", "capturePolicy", "size"],
     exitCodes: { "0": "recording started", "2": "invalid input", "4": "startup failed" },
   },
   {
@@ -75,7 +84,7 @@ const COMMANDS = [
     parameters: [{ name: "--recording-id", type: "uuid", required: true }],
     agentInstructions: [
       "This command does not change the recording.",
-      "During validation, confirm data.capture.frame increases between status calls.",
+      "During validation, confirm data.capture.frame increases between status calls; under full CPU load, wait and retry one stalled sample.",
     ],
     returns: [
       "status",
@@ -86,6 +95,10 @@ const COMMANDS = [
       "key",
       "contentType",
       "sizeBytes",
+      "measuredFps",
+      "frames",
+      "durationSeconds",
+      "capturePolicy",
     ],
     exitCodes: {
       "0": "status read",
@@ -106,8 +119,20 @@ const COMMANDS = [
       "Call stop once; concurrent or repeated calls for the same recording are idempotent.",
       "Continue reading NDJSON progress events from stderr until the command exits.",
       "Do not end the Sandbox unless exit is 0 and the stdout envelope contains data.url.",
+      "Treat data.measuredFps as telemetry, not a pass or fail threshold.",
     ],
-    returns: ["status", "recordingId", "url", "key", "contentType", "sizeBytes"],
+    returns: [
+      "status",
+      "recordingId",
+      "url",
+      "key",
+      "contentType",
+      "sizeBytes",
+      "measuredFps",
+      "frames",
+      "durationSeconds",
+      "capturePolicy",
+    ],
     exitCodes: {
       "0": "proof uploaded",
       "2": "invalid input",
@@ -168,8 +193,11 @@ async function startCommand(argv: readonly string[]): Promise<number> {
     new Set(["fps", "size", "url", "uploads-workspace", "startup-timeout-ms"]),
   );
   const recordingId = randomUUID();
-  const fpsValue = integer(flags.get("fps") ?? String(DEFAULT_FPS), "--fps");
-  if (fpsValue !== 30 && fpsValue !== 60) throw new UsageError("--fps must be 30 or 60");
+  const fpsFlag = flags.get("fps") ?? DEFAULT_FPS;
+  if (fpsFlag !== "auto" && fpsFlag !== "30" && fpsFlag !== "60") {
+    throw new UsageError("--fps must be auto, 30, or 60");
+  }
+  const fpsValue = fpsFlag === "30" ? 30 : fpsFlag === "60" ? 60 : "auto";
   const { width, height } = parseSize(flags.get("size") ?? `${DEFAULT_WIDTH}x${DEFAULT_HEIGHT}`);
   const workspace = flags.get("uploads-workspace") ?? process.env.UPLOADS_WORKSPACE;
   const initialUrl = flags.get("url");
@@ -201,6 +229,7 @@ async function startCommand(argv: readonly string[]): Promise<number> {
       recordingId: state.id,
       display: state.display,
       fps: state.fps,
+      ...defined({ capturePolicy: state.capturePolicy }),
       size: `${state.width}x${state.height}`,
       agentBrowserCommand: [
         "agent-browser",
@@ -315,6 +344,8 @@ function statusPayload(status: Extract<RecordingSessionStatus, { readonly exists
     startedAt: state.startedAt,
     updatedAt: state.updatedAt,
     ...defined({ finishedAt: state.finishedAt }),
+    ...defined({ capturePolicy: state.capturePolicy }),
+    ...(state.media === undefined ? {} : state.media),
     ...(state.publication === undefined ? {} : state.publication),
     ...defined({ error: state.failure }),
     ...defined({ warnings: state.warnings }),
@@ -349,6 +380,7 @@ function helpPayload(): object {
     prerequisites: [
       "Node.js >=24",
       "FFmpeg and ffprobe",
+      "nice from GNU coreutils",
       "Xvfb and openbox",
       "agent-browser with Chromium",
       "authenticated uploads.sh CLI",
@@ -388,7 +420,7 @@ function commandDefinition(name: string): (typeof COMMANDS)[number] {
 }
 
 function brief(): string {
-  return "sandbox-video records the headed agent-browser display inside an existing Vercel Sandbox at 30 or 60 FPS, verifies one browser-compatible MP4, uploads it through uploads.sh, and returns the proof URL.";
+  return "sandbox-video automatically targets the highest practical frame rate while protecting agent work inside an existing Vercel Sandbox, verifies one browser-compatible MP4, reports its measured frame rate, uploads it through uploads.sh, and returns the proof URL.";
 }
 
 function runtimeDirectoryFor(recordingId: string): string {

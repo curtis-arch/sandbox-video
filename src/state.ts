@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, open, rename, writeFile } from "node:fs/promises";
+import { availableParallelism } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
 import {
@@ -72,7 +73,7 @@ export interface StartSessionOptions {
   readonly runtimeDirectory: string;
   readonly width: number;
   readonly height: number;
-  readonly fps: 30 | 60;
+  readonly fps?: "auto" | 30 | 60;
   readonly segmentDurationSeconds?: number;
   readonly initialUrl?: string;
   readonly displayNumber?: number;
@@ -85,6 +86,20 @@ export interface StartSessionOptions {
 export interface StopSessionOptions {
   readonly runtimeDirectory: string;
   readonly timeoutMs?: number;
+}
+
+export interface RecordingMedia {
+  readonly measuredFps: number;
+  readonly frames: number;
+  readonly durationSeconds: number;
+}
+
+export interface RecordingCapturePolicy {
+  readonly mode: "auto" | "fixed";
+  readonly targetFps: 30 | 60;
+  readonly encoderPreset: "ultrafast" | "veryfast";
+  readonly processPriority: number;
+  readonly availableVcpus: number;
 }
 
 export interface RecordingSessionState {
@@ -104,11 +119,13 @@ export interface RecordingSessionState {
   readonly width: number;
   readonly height: number;
   readonly fps: 30 | 60;
+  readonly capturePolicy?: RecordingCapturePolicy;
   readonly segmentDurationSeconds: number;
   readonly supervisor: OwnedProcessIdentity;
   readonly xvfb?: OwnedProcessIdentity;
   readonly openbox?: OwnedProcessIdentity;
   readonly ffmpeg?: OwnedProcessIdentity;
+  readonly media?: RecordingMedia;
   readonly publication?: UploadsPublication;
   readonly browserStartAttemptedAt?: string;
   readonly browserClosedAt?: string;
@@ -146,6 +163,7 @@ export interface NormalizedSessionConfig {
   readonly width: number;
   readonly height: number;
   readonly fps: 30 | 60;
+  readonly capturePolicy: RecordingCapturePolicy;
   readonly segmentDurationSeconds: number;
   readonly initialUrl: string;
   readonly displayNumber?: number;
@@ -341,6 +359,47 @@ function assertStateOptionals(parsed: RawSessionState): void {
   if (parsed.publication !== undefined && !isPublication(parsed.publication)) {
     throw new Error("Invalid recording publication state");
   }
+  assertCapturePolicy(parsed.capturePolicy);
+  assertRecordingMedia(parsed.media);
+}
+
+function assertCapturePolicy(value: unknown): void {
+  if (value !== undefined && !isRecordingCapturePolicy(value)) {
+    throw new Error("Invalid recording capture policy state");
+  }
+}
+
+function isRecordingCapturePolicy(value: unknown): value is RecordingCapturePolicy {
+  return (
+    isRecord(value) &&
+    (value.mode === "auto" || value.mode === "fixed") &&
+    (value.targetFps === 30 || value.targetFps === 60) &&
+    (value.encoderPreset === "ultrafast" || value.encoderPreset === "veryfast") &&
+    typeof value.processPriority === "number" &&
+    Number.isInteger(value.processPriority) &&
+    value.processPriority >= 0 &&
+    value.processPriority <= 19 &&
+    isPositiveInteger(value.availableVcpus)
+  );
+}
+
+function assertRecordingMedia(value: unknown): void {
+  if (value !== undefined && !isRecordingMedia(value)) {
+    throw new Error("Invalid recording media state");
+  }
+}
+
+function isRecordingMedia(value: unknown): value is RecordingMedia {
+  return (
+    isRecord(value) &&
+    typeof value.measuredFps === "number" &&
+    Number.isFinite(value.measuredFps) &&
+    value.measuredFps > 0 &&
+    isPositiveInteger(value.frames) &&
+    typeof value.durationSeconds === "number" &&
+    Number.isFinite(value.durationSeconds) &&
+    value.durationSeconds > 0
+  );
 }
 
 interface RawSessionConfig {
@@ -349,6 +408,7 @@ interface RawSessionConfig {
   readonly width: number;
   readonly height: number;
   readonly fps: 30 | 60;
+  readonly capturePolicy?: unknown;
   readonly segmentDurationSeconds: number;
   readonly initialUrl: string;
   readonly displayNumber?: unknown;
@@ -370,12 +430,14 @@ export function parseConfig(source: string, configPath: string): NormalizedSessi
     throw new Error("Invalid recording upload config");
   }
   validateRecordingId(parsed.id);
+  const capturePolicy = parseCapturePolicy(parsed.capturePolicy, parsed.fps);
   return {
     id: parsed.id,
     runtimeDirectory,
     width: parsed.width,
     height: parsed.height,
     fps: parsed.fps,
+    capturePolicy,
     segmentDurationSeconds: parsed.segmentDurationSeconds,
     initialUrl: validateInitialUrl(parsed.initialUrl),
     ...defined({ displayNumber }),
@@ -437,12 +499,14 @@ function normalizeExecutables(overrides: RecordingExecutables): Required<Recordi
 
 export function normalizeOptions(options: StartSessionOptions): NormalizedSessionConfig {
   const displayNumber = normalizeDisplayNumber(options.displayNumber);
+  const capturePolicy = selectCapturePolicy(options.fps ?? "auto");
   return {
     id: validateRecordingId(options.recordingId ?? randomUUID()),
     runtimeDirectory: validateRuntimeDirectory(options.runtimeDirectory),
     width: captureDimension(options.width, "width"),
     height: captureDimension(options.height, "height"),
-    fps: validateFps(options.fps),
+    fps: capturePolicy.targetFps,
+    capturePolicy,
     segmentDurationSeconds: positiveInteger(
       options.segmentDurationSeconds ?? 10,
       "segmentDurationSeconds",
@@ -468,8 +532,36 @@ function captureDimension(value: number, label: string): number {
   return dimension;
 }
 
+function selectCapturePolicy(value: "auto" | 30 | 60): RecordingCapturePolicy {
+  const availableVcpus = availableParallelism();
+  const targetFps = value === "auto" ? 60 : validateFps(value);
+  return {
+    mode: value === "auto" ? "auto" : "fixed",
+    targetFps,
+    encoderPreset: availableVcpus <= 1 ? "ultrafast" : "veryfast",
+    processPriority: 10,
+    availableVcpus,
+  };
+}
+
 function validateFps(value: number): 30 | 60 {
-  if (value !== 30 && value !== 60) throw new Error("fps must be 30 or 60");
+  if (value !== 30 && value !== 60) throw new Error("fps must be auto, 30, or 60");
+  return value;
+}
+
+function parseCapturePolicy(value: unknown, fps: 30 | 60): RecordingCapturePolicy {
+  if (value === undefined) {
+    return {
+      mode: "fixed",
+      targetFps: fps,
+      encoderPreset: "veryfast",
+      processPriority: 0,
+      availableVcpus: availableParallelism(),
+    };
+  }
+  if (!isRecordingCapturePolicy(value) || value.targetFps !== fps) {
+    throw new Error("Invalid recording capture policy");
+  }
   return value;
 }
 
@@ -495,11 +587,26 @@ export function assertCompatibleSession(
     state.width !== requested.width ||
     state.height !== requested.height ||
     state.fps !== requested.fps ||
+    (state.capturePolicy !== undefined &&
+      !capturePoliciesMatch(state.capturePolicy, requested.capturePolicy)) ||
     state.segmentDurationSeconds !== requested.segmentDurationSeconds ||
     (requested.displayNumber !== undefined && state.display !== `:${requested.displayNumber}`)
   ) {
     throw new Error("runtimeDirectory already belongs to a different recording configuration");
   }
+}
+
+function capturePoliciesMatch(
+  first: RecordingCapturePolicy,
+  second: RecordingCapturePolicy,
+): boolean {
+  return (
+    first.mode === second.mode &&
+    first.targetFps === second.targetFps &&
+    first.encoderPreset === second.encoderPreset &&
+    first.processPriority === second.processPriority &&
+    first.availableVcpus === second.availableVcpus
+  );
 }
 
 /**

@@ -39,10 +39,25 @@ test("--help describes the complete command contract as JSON", () => {
     "key",
     "contentType",
     "sizeBytes",
+    "measuredFps",
+    "frames",
+    "durationSeconds",
+    "capturePolicy",
+  ]);
+  const stop = commands.find((command) => command.name === "stop");
+  assert.ok(stop !== undefined);
+  assert.deepEqual(array(stop.returns).slice(-4), [
+    "measuredFps",
+    "frames",
+    "durationSeconds",
+    "capturePolicy",
   ]);
   const start = commands.find((command) => command.name === "start");
   assert.ok(start !== undefined);
   const startParameters = array(start.parameters).map(object);
+  const fps = startParameters.find((parameter) => parameter.name === "--fps");
+  assert.equal(fps?.default, "auto");
+  assert.deepEqual(array(fps?.enum), ["auto", 30, 60]);
   assert.equal(
     startParameters.find((parameter) => parameter.name === "--url")?.default,
     "about:blank",
@@ -75,6 +90,14 @@ test("invalid input fails without stdout and explains recovery as JSON", () => {
   assert.equal(trailing.status, 2);
   assert.equal(trailing.stdout, "");
   assert.equal(object(parseJson(trailing.stderr)).ok, false);
+
+  const invalidFps = runCli("start", "--fps", "fast");
+  assert.equal(invalidFps.status, 2);
+  assert.equal(invalidFps.stdout, "");
+  assert.match(
+    string(object(object(parseJson(invalidFps.stderr)).error).message),
+    /auto, 30, or 60/u,
+  );
 });
 
 test("recording IDs remain case-insensitive", () => {

@@ -36,6 +36,7 @@ import {
   updateState,
   writeState,
   type NormalizedSessionConfig,
+  type RecordingMedia,
   type RecordingSessionState,
   type SessionPaths,
 } from "./state.js";
@@ -159,6 +160,7 @@ async function writeInitialState(
     width: config.width,
     height: config.height,
     fps: config.fps,
+    capturePolicy: config.capturePolicy,
     segmentDurationSeconds: config.segmentDurationSeconds,
     supervisor,
     phaseHistory: [{ phase: "starting", at: startedAt }],
@@ -322,6 +324,9 @@ function ffmpegCaptureArgs(
 ): [string, ...string[]] {
   const keyframeInterval = config.fps * 2;
   return [
+    "nice",
+    "-n",
+    String(config.capturePolicy.processPriority),
     config.executables.ffmpeg,
     "-y",
     "-hide_banner",
@@ -339,7 +344,7 @@ function ffmpegCaptureArgs(
     "-c:v",
     "libx264",
     "-preset",
-    "veryfast",
+    config.capturePolicy.encoderPreset,
     "-crf",
     "12",
     "-pix_fmt",
@@ -517,12 +522,13 @@ async function produceAndPublishMp4(
     if (!(await fileIsNonempty(temporaryMp4Path))) {
       throw new Error("Final MP4 remux produced no file");
     }
-    await verifyFinalMp4(
+    const media = await verifyFinalMp4(
       config,
       temporaryMp4Path,
       timeout(DEFAULT_MEDIA_COMMAND_TIMEOUT_MS, "MP4 verification"),
     );
     await rename(temporaryMp4Path, state.finalMp4Path);
+    state = await updateState(state, { media });
   } finally {
     await unlink(temporaryMp4Path).catch((error: unknown) => {
       if (!hasCode(error, "ENOENT")) {
@@ -659,7 +665,7 @@ async function verifyFinalMp4(
   config: NormalizedSessionConfig,
   path: string,
   timeoutMs: number,
-): Promise<void> {
+): Promise<RecordingMedia> {
   const probe = await runExact(
     [
       config.executables.ffprobe,
@@ -678,14 +684,18 @@ async function verifyFinalMp4(
     { timeoutMs },
   );
   requireSuccess("final MP4 probe", probe);
-  if (!matchesRequestedFormat(probeReport(probe.stdout), config)) {
-    throw new Error("Final MP4 does not match the requested H.264/yuv420p geometry and FPS");
+  const media = matchingMedia(probeReport(probe.stdout), config);
+  if (media === null) {
+    throw new Error(
+      "Final MP4 does not match the requested H.264/yuv420p geometry or contain playable frames",
+    );
   }
   const decode = await runExact(
     [config.executables.ffmpeg, "-v", "error", "-i", path, "-map", "0:v:0", "-f", "null", "-"],
     { timeoutMs },
   );
   requireSuccess("final MP4 decode", decode);
+  return media;
 }
 
 interface ProbeReport {
@@ -703,22 +713,37 @@ function probeReport(stdout: string): ProbeReport {
   return { video: stream, container: parsed.format };
 }
 
-function matchesRequestedFormat(report: ProbeReport, config: NormalizedSessionConfig): boolean {
+function matchingMedia(
+  report: ProbeReport,
+  config: NormalizedSessionConfig,
+): RecordingMedia | null {
   const { video, container } = report;
   const measuredFps = parseFrameRate(video.avg_frame_rate);
   const frames = typeof video.nb_frames === "string" ? Number(video.nb_frames) : Number.NaN;
   const duration = typeof container.duration === "string" ? Number(container.duration) : Number.NaN;
-  return (
-    video.codec_name === "h264" &&
-    video.pix_fmt === "yuv420p" &&
-    video.width === config.width &&
-    video.height === config.height &&
+  if (
+    matchesRequestedVideoFormat(video, config) &&
     measuredFps !== null &&
-    Math.abs(measuredFps - config.fps) <= 0.01 &&
+    measuredFps > 0 &&
     Number.isSafeInteger(frames) &&
     frames > 0 &&
     Number.isFinite(duration) &&
     duration > 0
+  ) {
+    return { measuredFps, frames, durationSeconds: duration };
+  }
+  return null;
+}
+
+function matchesRequestedVideoFormat(
+  video: Record<string, unknown>,
+  config: NormalizedSessionConfig,
+): boolean {
+  return (
+    video.codec_name === "h264" &&
+    video.pix_fmt === "yuv420p" &&
+    video.width === config.width &&
+    video.height === config.height
   );
 }
 

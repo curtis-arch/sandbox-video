@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { availableParallelism, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -15,7 +15,9 @@ import {
   type RecordingSessionState,
 } from "../src/session.js";
 import { identityIsAlive } from "../src/owned.js";
+import { assertCompatibleSession, normalizeOptions, parseConfig, readState } from "../src/state.js";
 import type { UploadsPublication } from "../src/uploads.js";
+import { parseObject } from "../src/util.js";
 
 const linuxOnly = { skip: process.platform !== "linux" } as const;
 
@@ -39,6 +41,7 @@ test("browser opens the configured URL before FFmpeg capture starts", linuxOnly,
   } satisfies Required<RecordingExecutables>;
   const persistentProcess =
     '#!/usr/bin/env node\nprocess.on("SIGINT",()=>process.exit(0));process.on("SIGTERM",()=>process.exit(0));setInterval(()=>{},1000);\n';
+  const expectedPreset = availableParallelism() <= 1 ? "ultrafast" : "veryfast";
 
   await Promise.all([
     writeExecutable(
@@ -47,9 +50,12 @@ test("browser opens the configured URL before FFmpeg capture starts", linuxOnly,
     ),
     writeExecutable(
       paths.ffmpeg,
-      `#!/usr/bin/env node\nconst fs=require("node:fs");const args=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(eventLog)},"ffmpeg\\n");const index=args.indexOf("-progress");if(index>=0)fs.writeFileSync(args[index+1],"frame=1\\nout_time_ms=16667\\nprogress=continue\\n");process.on("SIGINT",()=>process.exit(0));process.on("SIGTERM",()=>process.exit(0));setInterval(()=>{},1000);\n`,
+      `#!/usr/bin/env node\nconst fs=require("node:fs");const os=require("node:os");const args=process.argv.slice(2);const progress=args.indexOf("-progress");if(progress>=0){const preset=args[args.indexOf("-preset")+1];fs.appendFileSync(${JSON.stringify(eventLog)},"ffmpeg:"+os.getPriority(0)+":"+preset+"\\n");fs.writeFileSync(args[progress+1],"frame=1\\nout_time_ms=16667\\nprogress=continue\\n");fs.writeFileSync(args.at(-1),"playlist\\n");process.on("SIGINT",()=>process.exit(0));process.on("SIGTERM",()=>process.exit(0));setInterval(()=>{},1000)}else{if(args.at(-1)!=="-")fs.writeFileSync(args.at(-1),"video")}\n`,
     ),
-    writeExecutable(paths.ffprobe, "#!/bin/sh\nexit 0\n"),
+    writeExecutable(
+      paths.ffprobe,
+      '#!/bin/sh\nprintf \'%s\\n\' \'{"streams":[{"codec_name":"h264","pix_fmt":"yuv420p","width":1280,"height":720,"avg_frame_rate":"30/1","nb_frames":"30"}],"format":{"duration":"1"}}\'\n',
+    ),
     writeExecutable(paths.mcookie, "#!/bin/sh\nprintf 'abc123\\n'\n"),
     writeExecutable(paths.openbox, persistentProcess),
     writeExecutable(
@@ -71,7 +77,6 @@ test("browser opens the configured URL before FFmpeg capture starts", linuxOnly,
       runtimeDirectory,
       width: 1280,
       height: 720,
-      fps: 60,
       initialUrl,
       displayNumber: 65_007,
       startupTimeoutMs: 5_000,
@@ -80,10 +85,22 @@ test("browser opens the configured URL before FFmpeg capture starts", linuxOnly,
     });
 
     assert.equal(state.phase, "recording");
+    assert.deepEqual(state.capturePolicy, {
+      mode: "auto",
+      targetFps: 60,
+      encoderPreset: expectedPreset,
+      processPriority: 10,
+      availableVcpus: availableParallelism(),
+    });
+    assert.ok(state.ffmpeg !== undefined);
+    const ffmpegIdentity = state.ffmpeg;
     assert.deepEqual((await readFile(eventLog, "utf8")).trim().split("\n").slice(0, 2), [
       `browser:${initialUrl}`,
-      "ffmpeg",
+      `ffmpeg:10:${expectedPreset}`,
     ]);
+    const stopped = await stopSession({ runtimeDirectory, timeoutMs: 5_000 });
+    assert.equal(stopped.exists && stopped.state.phase, "finished");
+    assert.equal(await identityIsAlive(ffmpegIdentity), false);
   } finally {
     await stopSession({ runtimeDirectory, timeoutMs: 5_000 }).catch(() => undefined);
     await rm(root, { recursive: true, force: true });
@@ -150,6 +167,102 @@ test("startup timeout returns only after detached processes are reaped", linuxOn
   } finally {
     await stopSession({ runtimeDirectory, timeoutMs: 5_000 }).catch(() => undefined);
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("auto and fixed capture policies remain distinct when attaching", async () => {
+  const fixture = await createFixture({
+    recordingId: "00000000-0000-4000-8000-000000000013",
+    phase: "failed",
+    fps: 60,
+    upload: false,
+  });
+  try {
+    const common = {
+      recordingId: fixture.state.id,
+      runtimeDirectory: fixture.runtimeDirectory,
+      width: fixture.state.width,
+      height: fixture.state.height,
+    };
+    const automatic = normalizeOptions(common);
+    const fixed = normalizeOptions({ ...common, fps: 60 });
+
+    assert.equal(automatic.capturePolicy.mode, "auto");
+    assert.equal(automatic.capturePolicy.targetFps, 60);
+    assert.equal(fixed.capturePolicy.mode, "fixed");
+    assert.equal(fixed.capturePolicy.targetFps, 60);
+    assert.equal(fixed.capturePolicy.processPriority, 10);
+    assert.doesNotThrow(() =>
+      assertCompatibleSession({ ...fixture.state, capturePolicy: fixed.capturePolicy }, fixed),
+    );
+    assert.throws(
+      () =>
+        assertCompatibleSession(
+          { ...fixture.state, capturePolicy: automatic.capturePolicy },
+          fixed,
+        ),
+      /different recording configuration/u,
+    );
+    assert.doesNotThrow(() => assertCompatibleSession(fixture.state, fixed));
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("persisted capture policy and media reject invalid values", async () => {
+  const fixture = await createFixture({
+    recordingId: "00000000-0000-4000-8000-000000000014",
+    phase: "failed",
+    fps: 60,
+    upload: false,
+  });
+  const statePath = join(fixture.runtimeDirectory, "session.json");
+  try {
+    await writeFile(
+      statePath,
+      `${JSON.stringify({
+        ...fixture.state,
+        capturePolicy: {
+          mode: "auto",
+          targetFps: 60,
+          encoderPreset: "ultrafast",
+          processPriority: 20,
+          availableVcpus: 1,
+        },
+      })}\n`,
+    );
+    await assert.rejects(readState(fixture.runtimeDirectory), /capture policy state/u);
+
+    await writeFile(
+      statePath,
+      `${JSON.stringify({
+        ...fixture.state,
+        media: { measuredFps: 0, frames: 30, durationSeconds: 1 },
+      })}\n`,
+    );
+    await assert.rejects(readState(fixture.runtimeDirectory), /media state/u);
+
+    const configPath = join(fixture.runtimeDirectory, "session-config.json");
+    const config = parseObject(await readFile(configPath, "utf8"), "fixture config");
+    assert.throws(
+      () =>
+        parseConfig(
+          JSON.stringify({
+            ...config,
+            capturePolicy: {
+              mode: "auto",
+              targetFps: 30,
+              encoderPreset: "ultrafast",
+              processPriority: 10,
+              availableVcpus: 1,
+            },
+          }),
+          configPath,
+        ),
+      /Invalid recording capture policy/u,
+    );
+  } finally {
+    await fixture.cleanup();
   }
 });
 
@@ -246,6 +359,54 @@ test(
       assert.deepEqual(result.state, fixture.state);
     } finally {
       await fixture.cleanup();
+    }
+  },
+);
+
+test(
+  "finalization reports a lower measured FPS instead of rejecting the recording",
+  linuxOnly,
+  async () => {
+    const executableDirectory = await mkdtemp(join(tmpdir(), "sandbox-video-executables-"));
+    const ffmpeg = join(executableDirectory, "ffmpeg");
+    const ffprobe = join(executableDirectory, "ffprobe");
+    const recordingId = "00000000-0000-4000-8000-000000000010";
+    await writeExecutable(
+      ffmpeg,
+      '#!/bin/sh\nfor output do :; done\nif [ "$output" != "-" ]; then printf video > "$output"; fi\n',
+    );
+    await writeExecutable(
+      ffprobe,
+      '#!/bin/sh\nprintf \'%s\\n\' \'{"streams":[{"codec_name":"h264","pix_fmt":"yuv420p","width":1280,"height":720,"avg_frame_rate":"30/1","nb_frames":"90"}],"format":{"duration":"3"}}\'\n',
+    );
+    const fixture = await createFixture({
+      recordingId,
+      phase: "failed",
+      failure: "Previous finalization attempt failed",
+      fps: 60,
+      upload: false,
+      executables: { ffmpeg, ffprobe },
+    });
+    await mkdir(join(fixture.runtimeDirectory, "capture"), { recursive: true });
+    await writeFile(join(fixture.runtimeDirectory, "capture", "index.m3u8"), "playlist\n");
+
+    try {
+      const result = await stopSession({
+        runtimeDirectory: fixture.runtimeDirectory,
+        timeoutMs: 5_000,
+      });
+
+      assert.equal(result.exists, true);
+      if (!result.exists) return;
+      assert.equal(result.state.phase, "finished");
+      assert.deepEqual(result.state.media, {
+        measuredFps: 30,
+        frames: 90,
+        durationSeconds: 3,
+      });
+    } finally {
+      await fixture.cleanup();
+      await rm(executableDirectory, { recursive: true, force: true });
     }
   },
 );
@@ -416,6 +577,7 @@ interface FixtureOptions {
   readonly publication?: UploadsPublication;
   readonly openbox?: OwnedProcessIdentity;
   readonly failure?: string;
+  readonly fps?: 30 | 60;
   readonly browserStartAttempted?: boolean;
   readonly recordingReached?: boolean;
   readonly upload?: boolean;
@@ -436,7 +598,7 @@ async function createFixture(options: FixtureOptions): Promise<{
     runtimeDirectory,
     width: 1280,
     height: 720,
-    fps: 30 as const,
+    fps: options.fps ?? 30,
     segmentDurationSeconds: 10,
     initialUrl: "about:blank",
     startupTimeoutMs: 30_000,

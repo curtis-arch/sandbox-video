@@ -45,7 +45,9 @@ import { delay, errorMessage, hasCode, positiveInteger, remainingTimeout } from 
 export { RECORDING_STOP_PHASES } from "./state.js";
 export type {
   RecordingCaptureProgress,
+  RecordingCapturePolicy,
   RecordingExecutables,
+  RecordingMedia,
   RecordingSessionPhase,
   RecordingSessionState,
   RecordingSessionStatus,
