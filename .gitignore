@@ -2,6 +2,7 @@ node_modules/
 dist/
 .sandbox-video/
 .env.*
+.env
 !.env.example
 .vercel/
 codedb.snapshot
