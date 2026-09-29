@@ -210,6 +210,14 @@ export async function getSessionStatus(runtimeDirectory: string): Promise<Record
   return { exists: true, supervisorAlive, state, capture };
 }
 
+/** Upload selection persisted at start: an upload target means uploads.sh, none otherwise. */
+export async function getSessionUploadMode(
+  runtimeDirectory: string,
+): Promise<"uploads.sh" | "none"> {
+  const config = await readSessionConfig(validateRuntimeDirectory(runtimeDirectory));
+  return config.upload === undefined ? "none" : "uploads.sh";
+}
+
 /** Stop and finalize a recording. Repeated calls return the same terminal state. */
 export async function stopSession(options: StopSessionOptions): Promise<RecordingSessionStatus> {
   const directory = validateRuntimeDirectory(options.runtimeDirectory);

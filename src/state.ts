@@ -92,6 +92,8 @@ export interface RecordingMedia {
   readonly measuredFps: number;
   readonly frames: number;
   readonly durationSeconds: number;
+  /** Size of the verified local MP4. Absent in state written by 0.2.0 and earlier. */
+  readonly sizeBytes?: number;
 }
 
 export interface RecordingCapturePolicy {
@@ -398,7 +400,8 @@ function isRecordingMedia(value: unknown): value is RecordingMedia {
     isPositiveInteger(value.frames) &&
     typeof value.durationSeconds === "number" &&
     Number.isFinite(value.durationSeconds) &&
-    value.durationSeconds > 0
+    value.durationSeconds > 0 &&
+    (value.sizeBytes === undefined || isPositiveInteger(value.sizeBytes))
   );
 }
 

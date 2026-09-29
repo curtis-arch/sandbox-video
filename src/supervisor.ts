@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, realpath, rename, unlink } from "node:fs/promises";
+import { chmod, mkdir, realpath, rename, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -38,6 +38,7 @@ import {
   type NormalizedSessionConfig,
   type RecordingMedia,
   type RecordingSessionState,
+  type RecordingUploadOptions,
   type SessionPaths,
 } from "./state.js";
 import { uploadFinalMp4 } from "./uploads.js";
@@ -432,7 +433,9 @@ async function finalizeRecording(
     const produced = await producePhase(config, state, control, captureStopped, timeout, warnings);
     state = produced.state;
     failure ??= produced.failure;
-    if (config.upload !== undefined && state.publication === undefined) {
+    if (config.upload === undefined) {
+      if (state.media === undefined) failure ??= "Recording finished without a verified MP4";
+    } else if (state.publication === undefined) {
       failure ??= "Recording finished without an uploaded MP4";
     }
   } catch (error) {
@@ -481,22 +484,33 @@ async function producePhase(
   timeout: FinalizationTimeout,
   warnings: string[],
 ): Promise<FinalizationResult> {
-  if (!captureStopped || state.publication !== undefined) return { state };
+  if (!captureStopped || outputComplete(state, config)) return { state };
   if (await fileIsNonempty(state.playlistPath)) {
-    return { state: await produceAndPublishMp4(config, state, timeout, warnings) };
+    const produced = await produceMp4(config, state, timeout, warnings);
+    if (produced.failure !== undefined || config.upload === undefined) return produced;
+    return publishMp4(config.upload, produced.state, timeout);
   }
   return control.captureStarted
     ? { state, failure: "Recording supervisor stopped without producing an HLS playlist" }
     : { state };
 }
 
-/** Remux the HLS capture into one verified MP4, then upload it when configured. */
-async function produceAndPublishMp4(
+/** The requested output exists: a publication, or verified media when upload is off. */
+function outputComplete(state: RecordingSessionState, config: NormalizedSessionConfig): boolean {
+  return config.upload === undefined ? state.media !== undefined : state.publication !== undefined;
+}
+
+/**
+ * Remux the HLS capture into one verified MP4 at state.finalMp4Path. Failures
+ * are returned with the latest persisted state so cleanup never rewrites an
+ * older snapshot over it.
+ */
+async function produceMp4(
   config: NormalizedSessionConfig,
   initialState: RecordingSessionState,
   timeout: FinalizationTimeout,
   warnings: string[],
-): Promise<RecordingSessionState> {
+): Promise<FinalizationResult> {
   let state = await updateState(initialState, { phase: "finalizing_mp4" });
   const temporaryMp4Path = join(state.runtimeDirectory, `.recording-${randomUUID()}.tmp.mp4`);
   try {
@@ -527,8 +541,12 @@ async function produceAndPublishMp4(
       temporaryMp4Path,
       timeout(DEFAULT_MEDIA_COMMAND_TIMEOUT_MS, "MP4 verification"),
     );
+    const { size: sizeBytes } = await stat(temporaryMp4Path);
     await rename(temporaryMp4Path, state.finalMp4Path);
-    state = await updateState(state, { media });
+    state = await updateState(state, { media: { ...media, sizeBytes } });
+    return { state };
+  } catch (error) {
+    return { state, failure: errorMessage(error) };
   } finally {
     await unlink(temporaryMp4Path).catch((error: unknown) => {
       if (!hasCode(error, "ENOENT")) {
@@ -536,18 +554,27 @@ async function produceAndPublishMp4(
       }
     });
   }
-  if (config.upload !== undefined) {
-    state = await updateState(state, { phase: "uploading_mp4" });
+}
+
+/** Upload the verified MP4. An upload failure keeps the verified media in state. */
+async function publishMp4(
+  upload: RecordingUploadOptions,
+  initialState: RecordingSessionState,
+  timeout: FinalizationTimeout,
+): Promise<FinalizationResult> {
+  const state = await updateState(initialState, { phase: "uploading_mp4" });
+  try {
     const publication = await uploadFinalMp4({
       filePath: state.finalMp4Path,
-      key: config.upload.key,
-      ...defined({ workspace: config.upload.workspace }),
-      ...defined({ executable: config.upload.executable }),
+      key: upload.key,
+      ...defined({ workspace: upload.workspace }),
+      ...defined({ executable: upload.executable }),
       timeoutMs: timeout(DEFAULT_MEDIA_COMMAND_TIMEOUT_MS, "MP4 upload"),
     });
-    state = await updateState(state, { publication });
+    return { state: await updateState(state, { publication }) };
+  } catch (error) {
+    return { state, failure: errorMessage(error) };
   }
-  return state;
 }
 
 function managedProcessControl(processes: SuperviseProcesses): FinalizationProcessControl {

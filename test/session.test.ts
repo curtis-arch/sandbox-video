@@ -403,6 +403,7 @@ test(
         measuredFps: 30,
         frames: 90,
         durationSeconds: 3,
+        sizeBytes: 5,
       });
     } finally {
       await fixture.cleanup();
@@ -462,6 +463,16 @@ test(
       if (!failed.exists) return;
       assert.equal(failed.state.phase, "failed");
       assert.equal(failed.state.publication, undefined);
+      const durable = await readState(fixture.runtimeDirectory);
+      assert.deepEqual(durable?.media, {
+        measuredFps: 30,
+        frames: 30,
+        durationSeconds: 1,
+        sizeBytes: 5,
+      });
+      const phases = durable?.phaseHistory.map((entry) => entry.phase) ?? [];
+      assert.ok(phases.includes("finalizing_mp4") && phases.includes("uploading_mp4"));
+      assert.equal(await readFile(fixture.state.finalMp4Path, "utf8"), "video");
 
       hosted = true;
       const recovered = await stopSession({

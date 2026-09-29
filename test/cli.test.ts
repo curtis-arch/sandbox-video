@@ -33,8 +33,10 @@ test("--help describes the complete command contract as JSON", () => {
   assert.deepEqual(array(status.returns), [
     "status",
     "recordingId",
+    "upload",
     "supervisorAlive",
     "capture",
+    "path",
     "url",
     "key",
     "contentType",
@@ -100,6 +102,30 @@ test("invalid input fails without stdout and explains recovery as JSON", () => {
   );
 });
 
+test("upload selection is validated before a recording starts", () => {
+  const invalidFlag = runCli("start", "--upload", "s3");
+  assert.equal(invalidFlag.status, 2);
+  assert.equal(invalidFlag.stdout, "");
+  assert.match(errorMessage(invalidFlag.stderr), /^--upload must be uploads\.sh or none/u);
+
+  const invalidEnvironment = runCliWithEnvironment({ SANDBOX_VIDEO_UPLOAD: "s3" }, "start");
+  assert.equal(invalidEnvironment.status, 2);
+  assert.match(errorMessage(invalidEnvironment.stderr), /^SANDBOX_VIDEO_UPLOAD must be/u);
+
+  // The explicit flag wins over the invalid environment value, so the
+  // remaining error is the workspace conflict.
+  const conflict = runCliWithEnvironment(
+    { SANDBOX_VIDEO_UPLOAD: "s3" },
+    "start",
+    "--upload",
+    "none",
+    "--uploads-workspace",
+    "team",
+  );
+  assert.equal(conflict.status, 2);
+  assert.match(errorMessage(conflict.stderr), /--uploads-workspace cannot be used/u);
+});
+
 test("recording IDs remain case-insensitive", () => {
   const result = runCli("status", "--recording-id", "00000000-0000-4000-8000-00000000000A");
   assert.equal(result.status, 20);
@@ -112,8 +138,22 @@ function runCli(...arguments_: readonly string[]): {
   readonly stdout: string;
   readonly stderr: string;
 } {
-  const result = spawnSync(process.execPath, [cli.pathname, ...arguments_], { encoding: "utf8" });
+  return runCliWithEnvironment({}, ...arguments_);
+}
+
+function runCliWithEnvironment(
+  environment: Readonly<Record<string, string>>,
+  ...arguments_: readonly string[]
+): { readonly status: number | null; readonly stdout: string; readonly stderr: string } {
+  const result = spawnSync(process.execPath, [cli.pathname, ...arguments_], {
+    encoding: "utf8",
+    env: { ...process.env, ...environment },
+  });
   return { status: result.status, stdout: String(result.stdout), stderr: String(result.stderr) };
+}
+
+function errorMessage(stderr: string): string {
+  return string(object(object(parseJson(stderr)).error).message);
 }
 
 function parseJson(value: string): unknown {

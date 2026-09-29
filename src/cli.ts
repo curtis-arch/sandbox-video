@@ -5,11 +5,14 @@ import { join } from "node:path";
 
 import {
   getSessionStatus,
+  getSessionUploadMode,
   RECORDING_STOP_PHASES,
   startSession,
   stopSession,
   type RecordingSessionPhase,
+  type RecordingSessionState,
   type RecordingSessionStatus,
+  type RecordingUploadOptions,
 } from "./session.js";
 import { defined, delay } from "./util.js";
 
@@ -55,10 +58,22 @@ const COMMANDS = [
         description: "Open this page before display capture starts.",
       },
       {
+        name: "--upload",
+        type: "string",
+        required: false,
+        default: "uploads.sh",
+        enum: ["uploads.sh", "none"],
+        sourceFallback: "SANDBOX_VIDEO_UPLOAD",
+        description:
+          "uploads.sh uploads the verified MP4 and returns data.url; none keeps only the local MP4 at data.path.",
+      },
+      {
         name: "--uploads-workspace",
         type: "string",
         required: false,
         sourceFallback: "UPLOADS_WORKSPACE",
+        description:
+          "uploads.sh workspace. Rejected with --upload none; UPLOADS_WORKSPACE is ignored when upload is none.",
       },
       {
         name: "--startup-timeout-ms",
@@ -71,10 +86,19 @@ const COMMANDS = [
     agentInstructions: [
       "Retain data.recordingId and every token in data.agentBrowserCommand.",
       "Append each browser action to that exact agentBrowserCommand; do not create another session.",
-      "Confirm frame growth with status, then call stop and wait for its URL before ending the Sandbox.",
+      "Confirm frame growth with status, then call stop and wait for it to exit before ending the Sandbox.",
       "Leave --fps at auto unless the user requests a fixed ceiling.",
+      "With --upload none, the MP4 exists only on this machine; copy or attach data.path from stop before the Sandbox ends.",
     ],
-    returns: ["recordingId", "agentBrowserCommand", "display", "fps", "capturePolicy", "size"],
+    returns: [
+      "recordingId",
+      "upload",
+      "agentBrowserCommand",
+      "display",
+      "fps",
+      "capturePolicy",
+      "size",
+    ],
     exitCodes: { "0": "recording started", "2": "invalid input", "4": "startup failed" },
   },
   {
@@ -89,8 +113,10 @@ const COMMANDS = [
     returns: [
       "status",
       "recordingId",
+      "upload",
       "supervisorAlive",
       "capture",
+      "path",
       "url",
       "key",
       "contentType",
@@ -109,7 +135,8 @@ const COMMANDS = [
   },
   {
     name: "stop",
-    description: "Close the browser, finalize and verify one MP4, upload it, and clean up.",
+    description:
+      "Close the browser, finalize and verify one MP4, upload it unless upload is none, and clean up.",
     effect: "mutating-idempotent",
     parameters: [
       { name: "--recording-id", type: "uuid", required: true },
@@ -118,12 +145,15 @@ const COMMANDS = [
     agentInstructions: [
       "Call stop once; concurrent or repeated calls for the same recording are idempotent.",
       "Continue reading NDJSON progress events from stderr until the command exits.",
-      "Do not end the Sandbox unless exit is 0 and the stdout envelope contains data.url.",
+      "Do not end the Sandbox unless exit is 0. With upload uploads.sh, data.url is the hosted MP4; with none, copy or attach data.path first.",
+      "On failure, error.artifact, when present, describes a verified local MP4 that can be used on its own.",
       "Treat data.measuredFps as telemetry, not a pass or fail threshold.",
     ],
     returns: [
       "status",
       "recordingId",
+      "upload",
+      "path",
       "url",
       "key",
       "contentType",
@@ -134,7 +164,7 @@ const COMMANDS = [
       "capturePolicy",
     ],
     exitCodes: {
-      "0": "proof uploaded",
+      "0": "proof uploaded, or saved locally when upload is none",
       "2": "invalid input",
       "4": "finalization failed",
       "20": "recording not found",
@@ -190,7 +220,7 @@ async function main(argv: readonly string[]): Promise<number> {
 async function startCommand(argv: readonly string[]): Promise<number> {
   const flags = parseFlags(
     argv,
-    new Set(["fps", "size", "url", "uploads-workspace", "startup-timeout-ms"]),
+    new Set(["fps", "size", "url", "upload", "uploads-workspace", "startup-timeout-ms"]),
   );
   const recordingId = randomUUID();
   const fpsFlag = flags.get("fps") ?? DEFAULT_FPS;
@@ -199,7 +229,7 @@ async function startCommand(argv: readonly string[]): Promise<number> {
   }
   const fpsValue = fpsFlag === "30" ? 30 : fpsFlag === "60" ? 60 : "auto";
   const { width, height } = parseSize(flags.get("size") ?? `${DEFAULT_WIDTH}x${DEFAULT_HEIGHT}`);
-  const workspace = flags.get("uploads-workspace") ?? process.env.UPLOADS_WORKSPACE;
+  const { upload, target } = resolveUpload(flags, recordingId);
   const initialUrl = flags.get("url");
   const startupTimeout = flags.get("startup-timeout-ms");
   const startupTimeoutMs =
@@ -210,11 +240,7 @@ async function startCommand(argv: readonly string[]): Promise<number> {
     width,
     height,
     fps: fpsValue,
-    ...defined({ initialUrl, startupTimeoutMs }),
-    upload: {
-      key: `screenshots/sandbox-video/${recordingId}/proof.mp4`,
-      ...defined({ workspace }),
-    },
+    ...defined({ initialUrl, startupTimeoutMs, upload: target }),
   }).catch((error: unknown) => {
     throw new CommandError(
       `Recording ${recordingId} failed to start: ${error instanceof Error ? error.message : String(error)}`,
@@ -227,6 +253,7 @@ async function startCommand(argv: readonly string[]): Promise<number> {
     {
       status: "recording",
       recordingId: state.id,
+      upload,
       display: state.display,
       fps: state.fps,
       ...defined({ capturePolicy: state.capturePolicy }),
@@ -241,7 +268,9 @@ async function startCommand(argv: readonly string[]): Promise<number> {
       next: [
         "Append an agent-browser action to data.agentBrowserCommand for every browser interaction.",
         `Run sandbox-video status --recording-id ${state.id} to verify capture progress.`,
-        `Run sandbox-video stop --recording-id ${state.id} and wait for data.url before ending the Sandbox.`,
+        upload === "none"
+          ? `Run sandbox-video stop --recording-id ${state.id}, then copy or attach data.path before ending the Sandbox.`
+          : `Run sandbox-video stop --recording-id ${state.id} and wait for data.url before ending the Sandbox.`,
       ],
     },
     "start",
@@ -259,9 +288,11 @@ async function statusCommand(argv: readonly string[]): Promise<number> {
     throw new CommandError(
       status.state.failure ?? "Recording failed",
       `Inspect /tmp/sandbox-video/${recordingId} for retained state and logs; do not reuse this recording ID.`,
+      verifiedArtifact(status.state),
     );
   }
-  writeSuccess(statusPayload(status), "status", "none");
+  const upload = await getSessionUploadMode(runtimeDirectoryFor(recordingId));
+  writeSuccess(statusPayload(status, upload), "status", "none");
   return 0;
 }
 
@@ -275,49 +306,100 @@ async function stopCommand(argv: readonly string[]): Promise<number> {
   const runtimeDirectory = runtimeDirectoryFor(recordingId);
   const initial = await getSessionStatus(runtimeDirectory);
   if (!initial.exists) throw new NotFoundError(recordingId);
+  const upload = await getSessionUploadMode(runtimeDirectory);
+  const progress: StopProgress = {
+    recordingId,
+    phases:
+      upload === "none"
+        ? RECORDING_STOP_PHASES.filter((phase) => phase !== "uploading_mp4")
+        : RECORDING_STOP_PHASES,
+    seen: new Set(),
+  };
   const stop = stopSession({ runtimeDirectory, timeoutMs });
   let stopSettled = false;
   const settle = () => {
     stopSettled = true;
   };
   void stop.then(settle, settle);
-  const seen = new Set<RecordingSessionPhase>();
   emitStopPhases(
     initial.state.phaseHistory.map((entry) => entry.phase),
-    seen,
-    recordingId,
+    progress,
   );
-  await pollStopProgress(
-    runtimeDirectory,
-    recordingId,
-    seen,
-    Date.now() + timeoutMs,
-    () => stopSettled,
-  );
+  await pollStopProgress(runtimeDirectory, progress, Date.now() + timeoutMs, () => stopSettled);
   const result = await stop;
   if (!result.exists) throw new NotFoundError(recordingId);
+  const { state } = result;
   emitStopPhases(
-    result.state.phaseHistory.map((entry) => entry.phase),
-    seen,
-    recordingId,
+    state.phaseHistory.map((entry) => entry.phase),
+    progress,
   );
-  if (result.state.phase !== "finished" || result.state.publication === undefined) {
+  const output = upload === "none" ? state.media : state.publication;
+  if (state.phase !== "finished" || output === undefined) {
     throw new CommandError(
-      result.state.failure ??
-        (result.state.phase === "finished"
-          ? "Recording finished without an uploaded MP4"
-          : `Recording finalization ended in phase ${result.state.phase}`),
+      state.failure ??
+        (state.phase !== "finished"
+          ? `Recording finalization ended in phase ${state.phase}`
+          : upload === "none"
+            ? "Recording finished without a verified MP4"
+            : "Recording finished without an uploaded MP4"),
       `Run sandbox-video status --recording-id ${recordingId} to inspect retained state before deciding whether to retry.`,
+      verifiedArtifact(state),
     );
   }
-  writeSuccess(statusPayload(result), "stop", "proof-uploaded");
+  writeSuccess(
+    statusPayload(result, upload),
+    "stop",
+    upload === "none" ? "proof-saved" : "proof-uploaded",
+  );
   return 0;
+}
+
+type UploadMode = "uploads.sh" | "none";
+
+/**
+ * Resolve the upload selection once at start: --upload, then SANDBOX_VIDEO_UPLOAD,
+ * then uploads.sh. With none, no upload target is persisted and ambient
+ * UPLOADS_WORKSPACE is ignored.
+ */
+function resolveUpload(
+  flags: ReadonlyMap<string, string>,
+  recordingId: string,
+): { readonly upload: UploadMode; readonly target?: RecordingUploadOptions } {
+  const flag = flags.get("upload");
+  const upload = flag ?? process.env.SANDBOX_VIDEO_UPLOAD ?? "uploads.sh";
+  if (upload !== "uploads.sh" && upload !== "none") {
+    throw new UsageError(
+      `${flag === undefined ? "SANDBOX_VIDEO_UPLOAD" : "--upload"} must be uploads.sh or none`,
+    );
+  }
+  if (upload === "none") {
+    if (flags.has("uploads-workspace")) {
+      throw new UsageError(
+        "--uploads-workspace cannot be used when upload is none",
+        "Remove --uploads-workspace, or select --upload uploads.sh.",
+      );
+    }
+    return { upload };
+  }
+  const workspace = flags.get("uploads-workspace") ?? process.env.UPLOADS_WORKSPACE;
+  return {
+    upload,
+    target: {
+      key: `screenshots/sandbox-video/${recordingId}/proof.mp4`,
+      ...defined({ workspace }),
+    },
+  };
+}
+
+interface StopProgress {
+  readonly recordingId: string;
+  readonly phases: readonly RecordingSessionPhase[];
+  readonly seen: Set<RecordingSessionPhase>;
 }
 
 async function pollStopProgress(
   runtimeDirectory: string,
-  recordingId: string,
-  seen: Set<RecordingSessionPhase>,
+  progress: StopProgress,
   deadline: number,
   stopSettled: () => boolean,
 ): Promise<void> {
@@ -326,19 +408,22 @@ async function pollStopProgress(
     if (!current.exists) return;
     emitStopPhases(
       current.state.phaseHistory.map((entry) => entry.phase),
-      seen,
-      recordingId,
+      progress,
     );
     if (current.state.phase === "finished" || current.state.phase === "failed") return;
     await delay(POLL_INTERVAL_MS);
   }
 }
 
-function statusPayload(status: Extract<RecordingSessionStatus, { readonly exists: true }>): object {
+function statusPayload(
+  status: Extract<RecordingSessionStatus, { readonly exists: true }>,
+  upload: UploadMode,
+): object {
   const { state } = status;
   return {
     status: state.phase,
     recordingId: state.id,
+    upload,
     supervisorAlive: status.supervisorAlive,
     capture: status.capture,
     startedAt: state.startedAt,
@@ -346,22 +431,35 @@ function statusPayload(status: Extract<RecordingSessionStatus, { readonly exists
     ...defined({ finishedAt: state.finishedAt }),
     ...defined({ capturePolicy: state.capturePolicy }),
     ...(state.media === undefined ? {} : state.media),
+    ...verifiedArtifact(state),
     ...(state.publication === undefined ? {} : state.publication),
     ...defined({ error: state.failure }),
     ...defined({ warnings: state.warnings }),
   };
 }
 
-function emitStopPhases(
-  phases: readonly RecordingSessionPhase[],
-  seen: Set<RecordingSessionPhase>,
-  recordingId: string,
-): void {
-  for (const phase of RECORDING_STOP_PHASES) {
-    if (!phases.includes(phase) || seen.has(phase)) continue;
-    seen.add(phase);
+interface VerifiedArtifact {
+  readonly path: string;
+  readonly contentType: "video/mp4";
+  readonly sizeBytes?: number;
+}
+
+/** The local MP4 once finalization verified it; state records verification, not later existence. */
+function verifiedArtifact(state: RecordingSessionState): VerifiedArtifact | undefined {
+  if (state.media === undefined) return undefined;
+  return {
+    path: state.finalMp4Path,
+    contentType: "video/mp4",
+    ...defined({ sizeBytes: state.media.sizeBytes ?? state.publication?.sizeBytes }),
+  };
+}
+
+function emitStopPhases(phases: readonly RecordingSessionPhase[], progress: StopProgress): void {
+  for (const [index, phase] of progress.phases.entries()) {
+    if (!phases.includes(phase) || progress.seen.has(phase)) continue;
+    progress.seen.add(phase);
     process.stderr.write(
-      `${JSON.stringify({ schemaVersion: SCHEMA_VERSION, type: "progress", command: "stop", recordingId, step: RECORDING_STOP_PHASES.indexOf(phase) + 1, totalSteps: RECORDING_STOP_PHASES.length, phase })}\n`,
+      `${JSON.stringify({ schemaVersion: SCHEMA_VERSION, type: "progress", command: "stop", recordingId: progress.recordingId, step: index + 1, totalSteps: progress.phases.length, phase })}\n`,
     );
   }
 }
@@ -374,16 +472,17 @@ function helpPayload(): object {
       "Call start and retain data.recordingId plus every token in data.agentBrowserCommand.",
       "Use that exact command prefix for all agent-browser open, snapshot, click, and inspection calls.",
       "Call status and confirm data.capture.frame increases before final validation.",
-      "Call stop once, continue reading JSON progress from stderr, and wait for data.url on stdout.",
-      "Do not terminate the Sandbox until stop exits 0 and returns the hosted MP4 URL.",
+      "Call stop once, continue reading JSON progress from stderr, and wait for the stdout envelope.",
+      "Do not terminate the Sandbox until stop exits 0 and either returns the hosted MP4 URL or, with upload none, data.path has been copied or attached.",
     ],
     prerequisites: [
+      "Linux",
       "Node.js >=24",
       "FFmpeg and ffprobe",
       "nice from GNU coreutils",
       "Xvfb and openbox",
       "agent-browser with Chromium",
-      "authenticated uploads.sh CLI",
+      "authenticated uploads.sh CLI, unless upload is none",
     ],
     outputContract: {
       stdout: "On success, exactly one JSON response envelope; otherwise empty.",
@@ -420,7 +519,7 @@ function commandDefinition(name: string): (typeof COMMANDS)[number] {
 }
 
 function brief(): string {
-  return "sandbox-video automatically targets the highest practical frame rate while protecting agent work inside an existing Vercel Sandbox, verifies one browser-compatible MP4, reports its measured frame rate, uploads it through uploads.sh, and returns the proof URL.";
+  return "sandbox-video automatically targets the highest practical frame rate while protecting agent work inside an existing Vercel Sandbox, verifies one browser-compatible MP4, reports its measured frame rate and local path, and by default uploads it through uploads.sh and returns the proof URL.";
 }
 
 function runtimeDirectoryFor(recordingId: string): string {
@@ -507,6 +606,7 @@ function writeError(error: unknown, command: string): void {
           ? error.suggestion
           : "Inspect the message, verify prerequisites with sandbox-video --help, then retry only if the failed command is safe to repeat.",
       retryable: false,
+      ...(error instanceof CommandError ? defined({ artifact: error.artifact }) : {}),
     },
     meta: { cliVersion: CLI_VERSION, command, effect: failureEffect(error, command) },
   };
@@ -551,7 +651,15 @@ class UsageError extends CliError {
   }
 }
 
-class CommandError extends CliError {}
+class CommandError extends CliError {
+  constructor(
+    message: string,
+    suggestion: string,
+    readonly artifact?: VerifiedArtifact,
+  ) {
+    super(message, suggestion);
+  }
+}
 
 class NotFoundError extends CliError {
   constructor(recordingId: string) {
