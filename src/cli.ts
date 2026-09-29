@@ -16,7 +16,7 @@ import {
 } from "./session.js";
 import { defined, delay } from "./util.js";
 
-const CLI_VERSION = "0.2.0";
+const CLI_VERSION = "0.3.0";
 const SCHEMA_VERSION = 1 as const;
 const RUNTIME_ROOT = "/tmp/sandbox-video";
 const DEFAULT_WIDTH = 1920;

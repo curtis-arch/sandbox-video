@@ -1,10 +1,10 @@
 # sandbox-video
 
 `sandbox-video` records the headed browser while an AI coding agent works inside
-a Vercel Sandbox. It aims for 60 FPS when the machine has room, backs off when
-the agent needs the CPU, and publishes one browser-compatible MP4 through
-[`uploads.sh`](https://uploads.sh), or keeps it on the machine with
-`--upload none`.
+a Vercel Sandbox. It aims for 60 FPS when the machine has room and gives agent
+work priority when CPU is tight. It produces one browser-compatible MP4 and
+uploads it through [`uploads.sh`](https://uploads.sh) by default. Use
+`--upload none` to keep the MP4 on the recording machine.
 
 The CLI works alongside
 [`agent-browser`](https://github.com/vercel-labs/agent-browser). It leaves the
@@ -109,7 +109,7 @@ command leaves stdout empty and writes one JSON error envelope to stderr:
     ]
   },
   "meta": {
-    "cliVersion": "0.2.0",
+    "cliVersion": "0.3.0",
     "command": "start",
     "effect": "recording-started"
   }
@@ -137,31 +137,31 @@ sandbox-video status \
   --recording-id 865a5385-54c0-4efa-8b61-5013e6391737
 ```
 
-Finalize and publish:
+Finish the recording:
 
 ```sh
 sandbox-video stop \
   --recording-id 865a5385-54c0-4efa-8b61-5013e6391737
 ```
 
-`stop` reports five newline-delimited JSON progress events on stderr so an
-agent knows work is continuing (four with `--upload none`, which has no
-`uploading_mp4` step):
+`stop` reports five newline-delimited JSON progress events on stderr. With
+`--upload none`, it reports four steps and skips `uploading_mp4`:
 
 ```json
 {"schemaVersion":1,"type":"progress","command":"stop","recordingId":"865a5385-54c0-4efa-8b61-5013e6391737","step":1,"totalSteps":5,"phase":"closing_browser"}
 {"schemaVersion":1,"type":"progress","command":"stop","recordingId":"865a5385-54c0-4efa-8b61-5013e6391737","step":2,"totalSteps":5,"phase":"stopping_capture"}
 ```
 
-Its one stdout JSON object contains the terminal status, upload mode, absolute
-local MP4 `path`, hosted URL, storage key, content type, byte size, measured
-frame rate, frame count, and duration. Repeating `stop` returns the same
-terminal result without recording, probing, or uploading again.
+On success, the stdout JSON response includes the upload mode, absolute MP4
+`path`, content type, byte size, and recording metrics. It also includes the
+hosted `url` and storage `key` when uploads.sh is selected. Repeating a
+successful `stop` returns the same result without recording, probing, or
+uploading again.
 
 ### Keep the MP4 local
 
-Pass `--upload none` to `start` when the MP4 only needs to reach the same
-machine, for example to attach it to a pull request with the GitHub CLI:
+Pass `--upload none` to `start` to save the MP4 without uploading it. Your agent
+can then attach the file to a pull request with the GitHub CLI:
 
 ```sh
 sandbox-video start --url http://127.0.0.1:3000 --upload none
@@ -170,25 +170,34 @@ sandbox-video stop --recording-id <id>
 gh pr comment <pr> --attach "<data.path>" --body "Login flow after the fix"
 ```
 
-See [`gh pr comment`](https://cli.github.com/manual/gh_pr_comment) for
-attachment behavior; videos render as a player and take no alt text.
+Run `gh` on the recording machine, or copy the MP4 to the machine running
+`gh` first. Use a GitHub CLI version that supports `--attach`. Videos render
+as a player and do not accept image alt text. See the
+[`gh pr comment` documentation](https://cli.github.com/manual/gh_pr_comment).
 
-The selection is made once at `start` and stored with the recording. `--upload`
-takes precedence over the `SANDBOX_VIDEO_UPLOAD` environment variable, which
-takes precedence over the `uploads.sh` default, so an operator can set
-`SANDBOX_VIDEO_UPLOAD=none` for every recording on a machine. `start`,
-`status`, and `stop` report the stored choice as `data.upload`. With `none`:
+To make local recording the default in your environment, set:
 
-- no uploads.sh CLI or credentials are needed;
-- `--uploads-workspace` is rejected and `UPLOADS_WORKSPACE` is ignored;
-- `stop` returns `path`, `contentType`, `sizeBytes`, and the measured media
-  fields without `url` or `key`, with `meta.effect` set to `proof-saved`.
+```sh
+export SANDBOX_VIDEO_UPLOAD=none
+```
+
+An explicit `--upload` flag overrides this environment setting. If neither is
+set, the CLI uses uploads.sh. `start` stores the choice with the recording.
+Later changes to the environment do not affect that recording. Each command
+reports the stored choice as `data.upload`.
+
+With `none`, the CLI needs no uploads.sh installation or credentials. It
+rejects an explicit `--uploads-workspace` and ignores `UPLOADS_WORKSPACE`.
+`stop` returns `path`, `contentType`, `sizeBytes`, and recording metrics, with
+`meta.effect` set to `proof-saved`. The response has no `url` or `key`.
 
 The MP4 lives at `/tmp/sandbox-video/<recording-id>/recording.mp4` on the
-recording machine. `path` means the file was verified there, not that it still
-exists later. Copy or attach it before the Sandbox ends. GitHub
+recording machine. The CLI verifies the file before returning its path. It
+does not retain a separate copy if you delete the file or end the Sandbox.
+Copy or attach it before the Sandbox ends. GitHub
 [caps attached videos](https://docs.github.com/en/get-started/writing-on-github/working-with-advanced-formatting/attaching-files)
-at 10 MB on free plans and 100 MB on paid plans; compare with `sizeBytes`. The 24-second 1080p60 demo above is about 2.3 MB.
+at 10 MB on free plans and 100 MB on paid plans. Compare the limit with
+`sizeBytes` before attaching. The 24-second 1080p60 demo above is about 2.3 MB.
 
 ## Runtime ownership
 
@@ -250,10 +259,10 @@ npm install --global .
 Install the published CLI inside a prepared Sandbox image:
 
 ```sh
-npm install --global sandbox-video@0.2.0
+npm install --global sandbox-video@0.3.0
 ```
 
-An agent can instead use `npx --yes sandbox-video@0.2.0 <command>`. Pin the
+An agent can instead use `npx --yes sandbox-video@0.3.0 <command>`. Pin the
 same exact version for `start`, `status`, and `stop`. There is intentionally no
 self-update command or automatic update check: npm/npx owns installation, and
 the response schema must not change in the middle of a recording lifecycle.
@@ -337,18 +346,17 @@ remained, and the Sandbox was explicitly stopped.
 
 The CLI uses four exit codes:
 
-| Exit | Meaning                                                   |
-| ---: | --------------------------------------------------------- |
-|  `0` | Command completed; for `stop`, the final MP4 is delivered |
-|  `2` | Invalid command, option, or recording ID                  |
-|  `4` | Startup, capture, finalization, upload, or cleanup failed |
-| `20` | Recording ID does not exist in this Sandbox filesystem    |
+| Exit | Meaning                                                                       |
+| ---: | ----------------------------------------------------------------------------- |
+|  `0` | Command completed; `stop` verified the MP4 and completed any requested upload |
+|  `2` | Invalid command, option, or recording ID                                      |
+|  `4` | Startup, capture, finalization, upload, or cleanup failed                     |
+| `20` | Recording ID does not exist in this Sandbox filesystem                        |
 
-"Delivered" means uploaded with `uploads.sh`, or verified at `data.path` with
-`--upload none`. When `stop` or `status` fails after the MP4 was verified, the
-error envelope carries `error.artifact` with its `path`, `contentType`, and
-`sizeBytes`. That file is usable on its own even though the upload or cleanup
-failed; repeating `stop` retries the remaining work as before.
+If an upload or cleanup fails after MP4 verification, `stop` and `status`
+return an error with `error.artifact`. It contains the local file's `path`,
+`contentType`, and `sizeBytes`. The caller can still use that file. Repeating
+`stop` attempts recovery, but the CLI does not retry automatically.
 
 The current uploads.sh integration publishes only after explicit `stop`. Local
 HLS segments can recover from a supervisor failure while the Sandbox filesystem

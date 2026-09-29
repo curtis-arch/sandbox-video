@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.3.0] - 2026-09-29
+
+### Added
+
+- Use `start --upload none` to save a verified MP4 on the recording machine.
+  No uploads.sh installation or credentials are needed.
+- Set `SANDBOX_VIDEO_UPLOAD=none` to make local recording the default for your
+  environment. An explicit `--upload` flag overrides it.
+- Read the MP4's absolute `path`, `contentType`, and `sizeBytes` from the
+  command output after finalization. An agent can use the path to attach the
+  video to GitHub or copy it elsewhere.
+
+### Fixed
+
+- Preserve verified MP4 metadata and recording phase history when an upload
+  fails. Failed `stop` and `status` responses include `error.artifact` so the
+  caller can still use the local file.
+
+Uploads.sh remains the default. Local files stay on the recording machine, so
+copy or attach them before ending an ephemeral Sandbox.
+
 ## [0.2.0] - 2026-09-01
 
 ### Added
